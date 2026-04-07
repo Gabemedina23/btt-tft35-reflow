@@ -4,188 +4,599 @@
 #include "reflow_profile.h"
 #include "max6675.h"
 #include "reflow_pins.h"
+#include <math.h>
 
 // =============================================================================
-// Reflow Menu Implementation Stubs
-//
-// These are placeholder implementations showing the structure and integration
-// points with the BTT TouchScreen firmware. The actual UI rendering will use
-// the BTT GUI API (GUI_DrawRect, GUI_DrawLine, GUI_DispString, etc.)
-//
-// BTT Menu Pattern:
-// - Each menu is a function that runs in a loop
-// - It handles its own touch/encoder input via KEY_GetValue()
-// - It draws to the screen via GUI_* functions
-// - It returns to the previous menu by calling CLOSE_MENU()
-// - Menu navigation uses OPEN_MENU(menuFunction)
-//
-// Key BTT APIs to use:
-//   GUI_SetColor(color)           - Set drawing color
-//   GUI_DrawRect(x,y,w,h)        - Draw rectangle
-//   GUI_FillRect(x,y,w,h)        - Fill rectangle
-//   GUI_DrawLine(x1,y1,x2,y2)    - Draw line (for temp graph)
-//   GUI_DispString(x,y,str)      - Draw text
-//   GUI_DispDec(x,y,val,len)     - Draw decimal number
-//   KEY_GetValue()               - Get button/touch input
-//   ICON_CustomReadDisplay(x,y,icon) - Display icon
-//
-// Colors defined in LCD_Colors.h:
-//   RED, GREEN, BLUE, YELLOW, WHITE, BLACK, GRAY, CYAN, etc.
+// Display layout constants (480x320 TFT)
 // =============================================================================
 
-// Forward declarations for helper functions
-static void DrawTempGraph(uint16_t x, uint16_t y, uint16_t w, uint16_t h);
-static void DrawStageIndicator(uint16_t x, uint16_t y);
-static void DrawTemperatureDisplay(uint16_t x, uint16_t y);
+// Graph area
+#define GRAPH_X       45   // left margin (room for Y-axis labels)
+#define GRAPH_Y       35   // top margin (room for header text)
+#define GRAPH_W       420  // graph width
+#define GRAPH_H       200  // graph height
+#define GRAPH_X2      (GRAPH_X + GRAPH_W)
+#define GRAPH_Y2      (GRAPH_Y + GRAPH_H)
+
+// Status bar area (below graph)
+#define STATUS_Y      (GRAPH_Y2 + 8)
+#define STATUS_H      (LCD_HEIGHT - STATUS_Y)
+
+// Colors for reflow stages
+#define COLOR_PREHEAT   YELLOW
+#define COLOR_SOAK      ORANGE
+#define COLOR_RAMP      MAT_RED
+#define COLOR_PEAK      RED
+#define COLOR_COOL      CYAN
+#define COLOR_TARGET    0x630C   // dark gray for target profile line
+#define COLOR_GRAPH_BG  BLACK
+#define COLOR_GRID      0x2104   // very dark gray grid lines
+#define COLOR_AXIS      WHITE
+#define COLOR_TEXT       WHITE
+#define COLOR_ERROR     RED
+
+// Refresh rate
+#define GRAPH_REFRESH_MS  1000
 
 // =============================================================================
-// Main Reflow Menu
+// Helper: map temperature/time to pixel coordinates
+// =============================================================================
+
+static float graphTempMax = 280.0f;
+static float graphTimeMax = 360.0f;  // 6 minutes default
+
+static uint16_t tempToY(float temp)
+{
+  if (temp < 0) temp = 0;
+  if (temp > graphTempMax) temp = graphTempMax;
+  // Y is inverted (0 at top)
+  return GRAPH_Y2 - (uint16_t)((temp / graphTempMax) * GRAPH_H);
+}
+
+static uint16_t timeToX(float timeSec)
+{
+  if (timeSec < 0) timeSec = 0;
+  if (timeSec > graphTimeMax) timeSec = graphTimeMax;
+  return GRAPH_X + (uint16_t)((timeSec / graphTimeMax) * GRAPH_W);
+}
+
+// =============================================================================
+// Get color for current stage
+// =============================================================================
+
+static uint16_t getStageColor(ReflowState state)
+{
+  switch (state)
+  {
+    case REFLOW_PREHEAT:  return COLOR_PREHEAT;
+    case REFLOW_SOAK:     return COLOR_SOAK;
+    case REFLOW_RAMP:     return COLOR_RAMP;
+    case REFLOW_PEAK:     return COLOR_PEAK;
+    case REFLOW_COOL:     return COLOR_COOL;
+    case REFLOW_ERROR:    return COLOR_ERROR;
+    default:              return GREEN;
+  }
+}
+
+// =============================================================================
+// Draw graph axes and grid
+// =============================================================================
+
+static void drawGraphFrame(void)
+{
+  char str[8];
+
+  // Background
+  GUI_SetColor(COLOR_GRAPH_BG);
+  GUI_FillRect(GRAPH_X, GRAPH_Y, GRAPH_X2, GRAPH_Y2);
+
+  // Grid lines (horizontal - temperature)
+  GUI_SetColor(COLOR_GRID);
+  for (int t = 50; t <= (int)graphTempMax; t += 50)
+  {
+    uint16_t y = tempToY((float)t);
+    GUI_HLine(GRAPH_X, y, GRAPH_X2);
+  }
+
+  // Grid lines (vertical - time)
+  for (int s = 60; s <= (int)graphTimeMax; s += 60)
+  {
+    uint16_t x = timeToX((float)s);
+    GUI_VLine(x, GRAPH_Y, GRAPH_Y2);
+  }
+
+  // Axes
+  GUI_SetColor(COLOR_AXIS);
+  GUI_HLine(GRAPH_X, GRAPH_Y2, GRAPH_X2);  // X axis
+  GUI_VLine(GRAPH_X, GRAPH_Y, GRAPH_Y2);   // Y axis
+
+  // Y-axis labels (temperature)
+  GUI_SetColor(COLOR_TEXT);
+  for (int t = 50; t <= (int)graphTempMax; t += 50)
+  {
+    uint16_t y = tempToY((float)t);
+    sprintf(str, "%d", t);
+    _GUI_DispStringRight(GRAPH_X - 3, y - BYTE_HEIGHT / 2, (uint8_t *)str);
+  }
+
+  // X-axis labels (time in minutes)
+  for (int s = 60; s <= (int)graphTimeMax; s += 60)
+  {
+    uint16_t x = timeToX((float)s);
+    sprintf(str, "%dm", s / 60);
+    _GUI_DispStringCenter(x, GRAPH_Y2 + 2, (uint8_t *)str);
+  }
+}
+
+// =============================================================================
+// Draw the target profile curve (dashed gray)
+// =============================================================================
+
+static void drawTargetProfile(const ReflowProfile *profile, float startTemp)
+{
+  GUI_SetColor(COLOR_TARGET);
+
+  float curTemp = startTemp;
+  float curTime = 0;
+  uint16_t prevX = timeToX(0);
+  uint16_t prevY = tempToY(startTemp);
+
+  for (uint8_t i = 0; i < profile->numStages; i++)
+  {
+    const ReflowStage *stage = &profile->stages[i];
+    float tempDelta = fabsf(stage->targetTemp - curTemp);
+    float rampRate = fabsf(stage->rampRate);
+    float rampTime = (rampRate > 0.01f) ? (tempDelta / rampRate) : 0;
+
+    // End of ramp
+    float rampEndTime = curTime + rampTime;
+    uint16_t x1 = timeToX(rampEndTime);
+    uint16_t y1 = tempToY(stage->targetTemp);
+
+    // Draw ramp line (dashed: draw every other 4px segment)
+    // For simplicity, draw solid thin line in gray
+    GUI_DrawLine(prevX, prevY, x1, y1);
+
+    // Hold period
+    if (stage->holdTime > 0)
+    {
+      float holdEndTime = rampEndTime + stage->holdTime;
+      uint16_t x2 = timeToX(holdEndTime);
+      GUI_HLine(x1, y1, x2);
+      curTime = holdEndTime;
+      prevX = x2;
+    }
+    else
+    {
+      curTime = rampEndTime;
+      prevX = x1;
+    }
+
+    prevY = y1;
+    curTemp = stage->targetTemp;
+  }
+}
+
+// =============================================================================
+// Draw actual temperature history
+// =============================================================================
+
+static void drawTempHistory(const ReflowController *state)
+{
+  const TempHistory *hist = &state->history;
+  if (hist->count < 2) return;
+
+  uint16_t color = getStageColor(state->state);
+  GUI_SetColor(color);
+
+  uint16_t start = 0;
+  if (hist->count >= TEMP_HISTORY_SIZE)
+    start = hist->head;
+
+  uint16_t prevIdx = start;
+  float prevTime = 0;
+  uint16_t prevX = timeToX(0);
+  uint16_t prevY = tempToY(hist->samples[prevIdx]);
+
+  for (uint16_t i = 1; i < hist->count; i++)
+  {
+    uint16_t idx = (start + i) % TEMP_HISTORY_SIZE;
+    float t = (float)i;  // 1 sample per second
+    uint16_t x = timeToX(t);
+    uint16_t y = tempToY(hist->samples[idx]);
+
+    // Clip to graph area
+    if (x > GRAPH_X && x < GRAPH_X2 && prevX >= GRAPH_X)
+    {
+      GUI_DrawLine(prevX, prevY, x, y);
+    }
+
+    prevX = x;
+    prevY = y;
+    (void)prevTime;
+    prevTime = t;
+  }
+
+  // Draw current position marker (filled circle)
+  if (hist->count > 0)
+  {
+    uint16_t lastIdx = (start + hist->count - 1) % TEMP_HISTORY_SIZE;
+    uint16_t cx = timeToX((float)(hist->count - 1));
+    uint16_t cy = tempToY(hist->samples[lastIdx]);
+    if (cx > GRAPH_X + 3 && cx < GRAPH_X2 - 3)
+    {
+      GUI_SetColor(WHITE);
+      GUI_FillCircle(cx, cy, 3);
+      GUI_SetColor(color);
+      GUI_DrawCircle(cx, cy, 3);
+    }
+  }
+}
+
+// =============================================================================
+// Draw status bar (below graph)
+// =============================================================================
+
+static void drawStatusBar(const ReflowController *state)
+{
+  char str[64];
+  uint16_t y = STATUS_Y;
+
+  // Clear status area
+  GUI_SetColor(infoSettings.bg_color);
+  GUI_FillRect(0, y, LCD_WIDTH, LCD_HEIGHT);
+
+  // Left side: Current temp, target, duty
+  GUI_SetColor(getStageColor(state->state));
+  sprintf(str, "%.1fC", (double)state->currentTemp);
+  _GUI_DispString(5, y, (uint8_t *)str);
+
+  GUI_SetColor(COLOR_TEXT);
+  sprintf(str, "/ %.0fC", (double)state->targetTemp);
+  _GUI_DispString(100, y, (uint8_t *)str);
+
+  sprintf(str, "Duty:%.0f%%", (double)state->dutyCycle);
+  _GUI_DispString(210, y, (uint8_t *)str);
+
+  // Stage name
+  GUI_SetColor(getStageColor(state->state));
+  sprintf(str, "%s", Reflow_GetStateName(state->state));
+  _GUI_DispStringRight(LCD_WIDTH - 5, y, (uint8_t *)str);
+
+  // Second row: elapsed / remaining, profile name
+  y += BYTE_HEIGHT + 2;
+  GUI_SetColor(COLOR_TEXT);
+
+  uint32_t elapsed = Reflow_GetElapsedTime();
+  uint32_t remaining = Reflow_GetRemainingTime();
+  sprintf(str, "Time: %lu:%02lu / ~%lu:%02lu",
+          (unsigned long)(elapsed / 60), (unsigned long)(elapsed % 60),
+          (unsigned long)((elapsed + remaining) / 60), (unsigned long)((elapsed + remaining) % 60));
+  _GUI_DispString(5, y, (uint8_t *)str);
+
+  // Fan indicator
+  if (state->fanOn)
+  {
+    GUI_SetColor(CYAN);
+    _GUI_DispStringRight(LCD_WIDTH - 5, y, (uint8_t *)"FAN ON");
+  }
+}
+
+// =============================================================================
+// Draw header bar
+// =============================================================================
+
+static void drawHeader(const char *profileName, const ReflowController *state)
+{
+  char str[64];
+
+  GUI_SetColor(infoSettings.bg_color);
+  GUI_FillRect(0, 0, LCD_WIDTH, GRAPH_Y - 2);
+
+  GUI_SetColor(COLOR_TEXT);
+  sprintf(str, "Profile: %s", profileName);
+  _GUI_DispString(5, 5, (uint8_t *)str);
+
+  // Encoder button hint
+  GUI_SetColor(MAT_RED);
+  _GUI_DispStringRight(LCD_WIDTH - 5, 5, (uint8_t *)"[Click=ABORT]");
+}
+
+// =============================================================================
+// Main Reflow Menu (entry point)
 // =============================================================================
 
 void menuReflowMain(void)
 {
-  // TODO: Implement main menu with BTT icon grid layout
-  //
-  // Layout (8 icon slots, BTT standard):
-  // ┌─────────┬─────────┬─────────┬─────────┐
-  // │  Start  │ Profile │  PID    │ Monitor │
-  // │ Reflow  │ Select  │  Tune   │  Temp   │
-  // ├─────────┼─────────┼─────────┼─────────┤
-  // │ Settings│         │         │  Back   │
-  // │         │         │         │         │
-  // └─────────┴─────────┴─────────┴─────────┘
-  //
-  // Implementation pattern:
-  //   MENUITEMS reflowItems = {
-  //     8,                              // item count
-  //     {ICON_NULL, ICON_NULL, ...},    // title icons
-  //     {ICON_NULL, ICON_NULL, ...},    // item icons
-  //     {"Start", "Profile", "PID", "Monitor", "Settings", "", "", "Back"},
-  //     {menuReflowActive, menuReflowProfiles, menuReflowPIDTune,
-  //      menuReflowMonitor, menuReflowSettings, NULL, NULL, CLOSE_MENU},
-  //   };
-  //   menuDrawPage(&reflowItems);
-  //   // Handle key input in loop
+  MENUITEMS reflowItems = {
+    // title
+    LABEL_CUSTOM,  // reuse existing label slot for title
+    // icon                          label
+    {
+      {ICON_HEAT_FAN,                {.address = (void *)"Start"}},
+      {ICON_CUSTOM,                  {.address = (void *)"Profiles"}},
+      {ICON_FEATURE_SETTINGS,        {.address = (void *)"PID Tune"}},
+      {ICON_SCREEN_INFO,             {.address = (void *)"Monitor"}},
+      {ICON_SETTINGS,                {.address = (void *)"Settings"}},
+      {ICON_NULL,                    {.index = LABEL_NULL}},
+      {ICON_NULL,                    {.index = LABEL_NULL}},
+      {ICON_BACK,                    {.index = LABEL_BACK}},
+    }
+  };
+
+  KEY_VALUES key_num = KEY_IDLE;
+
+  menuDrawPage(&reflowItems);
+
+  while (MENU_IS(menuReflowMain))
+  {
+    key_num = menuKeyGetValue();
+
+    switch (key_num)
+    {
+      case KEY_ICON_0:  // Start Reflow
+      {
+        // Start with default leaded profile (TODO: remember last selection)
+        Reflow_Start(Profile_GetLeaded());
+        OPEN_MENU(menuReflowActive);
+        break;
+      }
+
+      case KEY_ICON_1:  // Profiles
+        OPEN_MENU(menuReflowProfiles);
+        break;
+
+      case KEY_ICON_2:  // PID Tune
+        OPEN_MENU(menuReflowPIDTune);
+        break;
+
+      case KEY_ICON_3:  // Monitor
+        OPEN_MENU(menuReflowMonitor);
+        break;
+
+      case KEY_ICON_4:  // Settings
+        OPEN_MENU(menuReflowSettings);
+        break;
+
+      case KEY_ICON_7:  // Back
+        CLOSE_MENU();
+        break;
+
+      default:
+        break;
+    }
+
+    loopProcess();
+  }
 }
 
 // =============================================================================
-// Active Reflow Screen (runs during reflow)
+// Active Reflow Screen (live during reflow)
 // =============================================================================
 
 void menuReflowActive(void)
 {
-  // TODO: Implement active reflow display
-  //
-  // Layout:
-  // ┌─────────────────────────────────────────────┐
-  // │  Profile: Leaded Sn63/Pb37     Stage: Soak  │
-  // │  ┌─────────────────────────────────────────┐ │
-  // │  │            Temperature Graph            │ │
-  // │  │  250┤                    ╱──╲           │ │
-  // │  │     │                 ╱      ╲          │ │
-  // │  │  200┤              ╱          ╲         │ │
-  // │  │     │          ╱──╱             ╲       │ │
-  // │  │  150┤      ╱──╱                   ╲     │ │
-  // │  │     │   ╱                           ╲   │ │
-  // │  │  100┤╱                                  │ │
-  // │  │     ├──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┤ │
-  // │  │     0  30 60 90 120 150 180 210 240 sec │ │
-  // │  └─────────────────────────────────────────┘ │
-  // │  Current: 183°C  Target: 183°C  Duty: 45%   │
-  // │  Time: 2:15 / 4:30        [ABORT]            │
-  // └─────────────────────────────────────────────┘
-  //
-  // The temperature graph shows:
-  //   - Profile target curve (dashed gray line)
-  //   - Actual temperature (solid colored line, color changes by stage)
-  //   - Current position marker
-  //
-  // Colors by stage:
-  //   Preheat = YELLOW
-  //   Soak    = ORANGE (or darker yellow)
-  //   Ramp    = RED
-  //   Peak    = MAGENTA
-  //   Cool    = CYAN
-  //   Error   = RED (flashing)
-  //
-  // Implementation:
-  //   while (1) {
-  //     Reflow_Update();  // Run control loop
-  //     const ReflowController *state = Reflow_GetState();
-  //
-  //     DrawTempGraph(10, 30, 460, 200);
-  //     DrawTemperatureDisplay(10, 240);
-  //     DrawStageIndicator(10, 10);
-  //
-  //     KEY_VALUES key = KEY_GetValue();
-  //     if (key == KEY_VALUE_CLICK) Reflow_Abort();
-  //     if (state->state == REFLOW_COMPLETE || state->state == REFLOW_ERROR)
-  //       break;
-  //   }
+  const GUI_RECT fullRect = {0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1};
+  const ReflowController *state = Reflow_GetState();
+  bool needsFullRedraw = true;
+
+  // Calculate graph scaling from profile
+  graphTempMax = Profile_GetPeakTemp(&state->profile) + 50.0f;
+  if (graphTempMax < 280.0f) graphTempMax = 280.0f;
+  graphTimeMax = (float)Profile_GetExpectedDuration(&state->profile, 25.0f) + 60.0f;
+  if (graphTimeMax < 300.0f) graphTimeMax = 300.0f;
+
+  setMenu(MENU_TYPE_FULLSCREEN, NULL, 1, &fullRect, NULL, NULL);
+
+  while (MENU_IS(menuReflowActive))
+  {
+    // Run the reflow control loop
+    Reflow_Update();
+
+    // Check for abort (encoder click or touch)
+    if (LCD_Enc_ReadBtn(200))
+    {
+      Reflow_Abort();
+    }
+
+    if (KEY_GetValue(1, &fullRect) == 0)
+    {
+      // Touch detected — abort if running, exit if done
+      if (state->state >= REFLOW_COMPLETE)
+      {
+        Reflow_Reset();
+        CLOSE_MENU();
+        break;
+      }
+      else if (state->state != REFLOW_IDLE)
+      {
+        Reflow_Abort();
+      }
+    }
+
+    // Refresh display at 1Hz
+    if (nextScreenUpdate(GRAPH_REFRESH_MS) || needsFullRedraw)
+    {
+      if (needsFullRedraw)
+      {
+        GUI_Clear(infoSettings.bg_color);
+        drawGraphFrame();
+        drawTargetProfile(&state->profile, 25.0f);
+        drawHeader(state->profile.name, state);
+        needsFullRedraw = false;
+      }
+
+      // Redraw temperature trace and status (incremental)
+      // Clear only the graph interior for redraw
+      GUI_SetColor(COLOR_GRAPH_BG);
+      GUI_FillRect(GRAPH_X + 1, GRAPH_Y + 1, GRAPH_X2 - 1, GRAPH_Y2 - 1);
+
+      // Redraw grid
+      GUI_SetColor(COLOR_GRID);
+      for (int t = 50; t <= (int)graphTempMax; t += 50)
+        GUI_HLine(GRAPH_X + 1, tempToY((float)t), GRAPH_X2 - 1);
+      for (int s = 60; s <= (int)graphTimeMax; s += 60)
+        GUI_VLine(timeToX((float)s), GRAPH_Y + 1, GRAPH_Y2 - 1);
+
+      // Target profile
+      drawTargetProfile(&state->profile, 25.0f);
+
+      // Actual temperature trace
+      drawTempHistory(state);
+
+      // Status bar
+      drawStatusBar(state);
+
+      // WS2812 LED color based on state
+      // (Uses existing BTT LED infrastructure)
+    }
+
+    // Check if reflow finished or errored
+    if (state->state == REFLOW_COMPLETE)
+    {
+      // Show completion message
+      Buzzer_Play(SOUND_SUCCESS);
+
+      GUI_SetColor(GREEN);
+      _GUI_DispStringInRect(0, GRAPH_Y + GRAPH_H / 2 - BYTE_HEIGHT,
+                            LCD_WIDTH, GRAPH_Y + GRAPH_H / 2 + BYTE_HEIGHT,
+                            (uint8_t *)"REFLOW COMPLETE - Touch to exit");
+    }
+    else if (state->state == REFLOW_ERROR)
+    {
+      Buzzer_Play(SOUND_ERROR);
+
+      GUI_SetColor(RED);
+      char errStr[64];
+      sprintf(errStr, "ERROR: %s - Touch to exit", Reflow_GetErrorName(state->error));
+      _GUI_DispStringInRect(0, GRAPH_Y + GRAPH_H / 2 - BYTE_HEIGHT,
+                            LCD_WIDTH, GRAPH_Y + GRAPH_H / 2 + BYTE_HEIGHT,
+                            (uint8_t *)errStr);
+    }
+    else if (state->state == REFLOW_ABORTED)
+    {
+      Buzzer_Play(SOUND_CANCEL);
+
+      GUI_SetColor(YELLOW);
+      _GUI_DispStringInRect(0, GRAPH_Y + GRAPH_H / 2 - BYTE_HEIGHT,
+                            LCD_WIDTH, GRAPH_Y + GRAPH_H / 2 + BYTE_HEIGHT,
+                            (uint8_t *)"ABORTED - Touch to exit");
+    }
+
+    loopProcess();
+  }
 }
 
 // =============================================================================
-// Profile Selection
+// Profile Selection Menu
 // =============================================================================
 
 void menuReflowProfiles(void)
 {
-  // TODO: List profiles in a scrollable list
-  //
-  // Built-in profiles:
-  //   [1] Leaded Sn63/Pb37    Peak: 230°C  Duration: ~4:30
-  //   [2] Lead-Free SAC305    Peak: 250°C  Duration: ~5:30
-  //
-  // SD card profiles:
-  //   [3] Custom Profile 1    (loaded from /profiles/*.json)
-  //   ...
-  //
-  // Touch a profile to select it, then:
-  //   [Start]  [Edit]  [Back]
+  MENUITEMS profileItems = {
+    LABEL_CUSTOM,  // reuse existing label slot for title
+    {
+      {ICON_HEAT_FAN,     {.address = (void *)"Leaded"}},
+      {ICON_HEAT_FAN,     {.address = (void *)"Lead-Free"}},
+      {ICON_NULL,         {.index = LABEL_NULL}},
+      {ICON_NULL,         {.index = LABEL_NULL}},
+      {ICON_NULL,         {.index = LABEL_NULL}},
+      {ICON_NULL,         {.index = LABEL_NULL}},
+      {ICON_NULL,         {.index = LABEL_NULL}},
+      {ICON_BACK,         {.index = LABEL_BACK}},
+    }
+  };
+
+  KEY_VALUES key_num = KEY_IDLE;
+  menuDrawPage(&profileItems);
+
+  while (MENU_IS(menuReflowProfiles))
+  {
+    key_num = menuKeyGetValue();
+
+    switch (key_num)
+    {
+      case KEY_ICON_0:  // Leaded
+        Reflow_Start(Profile_GetLeaded());
+        OPEN_MENU(menuReflowActive);
+        break;
+
+      case KEY_ICON_1:  // Lead-Free
+        Reflow_Start(Profile_GetLeadFree());
+        OPEN_MENU(menuReflowActive);
+        break;
+
+      case KEY_ICON_7:  // Back
+        CLOSE_MENU();
+        break;
+
+      default:
+        break;
+    }
+
+    loopProcess();
+  }
 }
 
 // =============================================================================
-// Profile Editor
+// Profile Editor (placeholder)
 // =============================================================================
 
 void menuReflowProfileEdit(void)
 {
-  // TODO: Edit individual profile stages
-  //
-  // Show each stage as a row:
-  //   Stage      Target   Ramp    Hold
-  //   Preheat    [150°C]  [2.0]   [0s]
-  //   Soak       [183°C]  [0.7]   [60s]
-  //   Reflow     [230°C]  [2.0]   [0s]
-  //   Peak       [230°C]  [hold]  [15s]
-  //   Cool       [50°C]   [-3.0]  [0s]
-  //
-  // Touch a value to edit via numpad or encoder
-  // [Save to SD]  [Reset]  [Back]
+  // TODO: Implement stage-by-stage editing with numpad
+  CLOSE_MENU();
 }
 
 // =============================================================================
-// PID Tuning
+// PID Tuning Menu
 // =============================================================================
 
 void menuReflowPIDTune(void)
 {
-  // TODO: Real-time PID tuning with live feedback
-  //
-  // Layout:
-  //   Kp: [200.0]   ▲ ▼
-  //   Ki: [  5.0]   ▲ ▼
-  //   Kd: [1000.0]  ▲ ▼
-  //
-  //   Target: [150°C]  [Set]
-  //   Current: 148.3°C
-  //   Output:  42.5%
-  //
-  //   [Live graph showing response to step change]
-  //
-  //   [Auto-Tune]  [Save]  [Back]
-  //
-  // Auto-tune: Run a relay feedback test to determine optimal PID gains
+  const GUI_RECT fullRect = {0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1};
+  const ReflowController *state = Reflow_GetState();
+  char str[64];
+
+  GUI_Clear(infoSettings.bg_color);
+  setMenu(MENU_TYPE_OTHER, NULL, 1, &fullRect, NULL, NULL);
+
+  GUI_SetColor(COLOR_TEXT);
+  _GUI_DispString(5, 5, (uint8_t *)"PID Tuning");
+  GUI_HLine(0, 25, LCD_WIDTH);
+
+  // Display current PID values
+  uint16_t y = 35;
+  sprintf(str, "Kp: %.1f", (double)state->profile.pidKp);
+  _GUI_DispString(5, y, (uint8_t *)str);
+
+  y += BYTE_HEIGHT + 4;
+  sprintf(str, "Ki: %.1f", (double)state->profile.pidKi);
+  _GUI_DispString(5, y, (uint8_t *)str);
+
+  y += BYTE_HEIGHT + 4;
+  sprintf(str, "Kd: %.1f", (double)state->profile.pidKd);
+  _GUI_DispString(5, y, (uint8_t *)str);
+
+  y += BYTE_HEIGHT + 8;
+  GUI_SetColor(YELLOW);
+  _GUI_DispString(5, y, (uint8_t *)"PID editor coming soon.");
+  y += BYTE_HEIGHT + 4;
+  _GUI_DispString(5, y, (uint8_t *)"Use Monitor mode to test oven response.");
+
+  // Bottom: touch to exit
+  GUI_SetColor(COLOR_TEXT);
+  GUI_HLine(0, LCD_HEIGHT - (BYTE_HEIGHT * 2), LCD_WIDTH);
+  _GUI_DispStringInRect(0, LCD_HEIGHT - (BYTE_HEIGHT * 2), LCD_WIDTH, LCD_HEIGHT,
+                        (uint8_t *)"Touch to go back");
+
+  while (MENU_IS(menuReflowPIDTune))
+  {
+    if (KEY_GetValue(1, &fullRect) == 0)
+      CLOSE_MENU();
+
+    loopProcess();
+  }
 }
 
 // =============================================================================
@@ -194,102 +605,157 @@ void menuReflowPIDTune(void)
 
 void menuReflowMonitor(void)
 {
-  // TODO: Simple temperature display for testing
-  //
-  // Shows:
-  //   ┌─────────────────────┐
-  //   │   Current: 24.5°C   │  (large font)
-  //   │   Status:  OK       │
-  //   │   Min: 24.2°C       │
-  //   │   Max: 25.1°C       │
-  //   │                     │
-  //   │   [Live temp graph]  │
-  //   │                     │
-  //   │   [Back]             │
-  //   └─────────────────────┘
-  //
-  // Useful for:
-  //   - Verifying thermocouple works before first reflow
-  //   - Testing oven insulation (manual heat + watch temp)
-  //   - Checking thermocouple placement
+  const GUI_RECT fullRect = {0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1};
+  char str[32];
+  float minTemp = 9999.0f, maxTemp = -1.0f;
+  bool firstDraw = true;
+
+  GUI_Clear(infoSettings.bg_color);
+  setMenu(MENU_TYPE_OTHER, NULL, 1, &fullRect, NULL, NULL);
+
+  while (MENU_IS(menuReflowMonitor))
+  {
+    // Update thermocouple
+    Reflow_Update();
+
+    if (KEY_GetValue(1, &fullRect) == 0)
+    {
+      CLOSE_MENU();
+      break;
+    }
+
+    if (nextScreenUpdate(500) || firstDraw)
+    {
+      firstDraw = false;
+      TC_Reading reading = MAX6675_GetLastReading();
+      float temp = MAX6675_GetFilteredTemp();
+
+      if (reading.status == TC_OK)
+      {
+        if (temp < minTemp) minTemp = temp;
+        if (temp > maxTemp) maxTemp = temp;
+      }
+
+      // Clear display area
+      GUI_SetColor(infoSettings.bg_color);
+      GUI_FillRect(0, 0, LCD_WIDTH, LCD_HEIGHT - BYTE_HEIGHT * 2);
+
+      // Title
+      GUI_SetColor(COLOR_TEXT);
+      _GUI_DispString(5, 5, (uint8_t *)"Temperature Monitor");
+      GUI_HLine(0, 25, LCD_WIDTH);
+
+      // Large temperature display
+      if (reading.status == TC_OK)
+      {
+        GUI_SetColor(GREEN);
+        sprintf(str, "%.1f C", (double)temp);
+        // Draw large (use available font)
+        GUI_SetColor(GREEN);
+        _GUI_DispStringCenter(LCD_WIDTH / 2, 60, (uint8_t *)str);
+      }
+      else if (reading.status == TC_OPEN)
+      {
+        GUI_SetColor(RED);
+        _GUI_DispStringCenter(LCD_WIDTH / 2, 60, (uint8_t *)"OPEN - No thermocouple");
+      }
+      else
+      {
+        GUI_SetColor(YELLOW);
+        _GUI_DispStringCenter(LCD_WIDTH / 2, 60, (uint8_t *)"Reading...");
+      }
+
+      // Stats
+      GUI_SetColor(COLOR_TEXT);
+      uint16_t y = 120;
+
+      sprintf(str, "Status: %s",
+              reading.status == TC_OK ? "Connected" :
+              reading.status == TC_OPEN ? "DISCONNECTED" : "Error");
+      _GUI_DispString(20, y, (uint8_t *)str);
+
+      y += BYTE_HEIGHT + 4;
+      if (minTemp < 9000.0f)
+      {
+        sprintf(str, "Min: %.1f C", (double)minTemp);
+        _GUI_DispString(20, y, (uint8_t *)str);
+      }
+
+      y += BYTE_HEIGHT + 4;
+      if (maxTemp > -0.5f)
+      {
+        sprintf(str, "Max: %.1f C", (double)maxTemp);
+        _GUI_DispString(20, y, (uint8_t *)str);
+      }
+
+      y += BYTE_HEIGHT + 4;
+      sprintf(str, "Raw: %.2f C", (double)reading.temperature);
+      _GUI_DispString(20, y, (uint8_t *)str);
+
+      // Bottom: touch to exit
+      GUI_SetColor(COLOR_TEXT);
+      GUI_HLine(0, LCD_HEIGHT - (BYTE_HEIGHT * 2), LCD_WIDTH);
+      _GUI_DispStringInRect(0, LCD_HEIGHT - (BYTE_HEIGHT * 2), LCD_WIDTH, LCD_HEIGHT,
+                            (uint8_t *)"Touch to go back");
+    }
+
+    loopProcess();
+  }
 }
 
 // =============================================================================
-// Settings
+// Settings Menu (placeholder)
 // =============================================================================
 
 void menuReflowSettings(void)
 {
-  // TODO: Configuration options
-  //
-  // SSR:
-  //   Active High / Active Low toggle
-  //   Test button (turn SSR on for 2 seconds)
-  //
-  // Fan:
-  //   Active High / Active Low toggle
-  //   Test button
-  //
-  // Safety:
-  //   Max Temperature: [280°C]
-  //   Thermal Runaway Threshold: [20°C]
-  //   Stage Timeout Multiplier: [3.0x]
-  //
-  // Display:
-  //   Temperature Unit: C / F
-  //   Graph Time Scale: 5min / 10min
-  //   LED Brightness: [slider]
-  //
-  // WiFi (if ESP32 connected):
-  //   Status: Connected / Not found
-  //   Send temperature data: On / Off
-}
+  const GUI_RECT fullRect = {0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1};
 
-// =============================================================================
-// Graph Drawing Helpers
-// =============================================================================
+  GUI_Clear(infoSettings.bg_color);
+  setMenu(MENU_TYPE_OTHER, NULL, 1, &fullRect, NULL, NULL);
 
-static void DrawTempGraph(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
-{
-  // TODO: Draw temperature vs time graph
-  //
-  // Algorithm:
-  // 1. Draw axes (white lines)
-  // 2. Draw Y-axis labels (50, 100, 150, 200, 250 °C)
-  // 3. Draw X-axis labels (time in seconds)
-  // 4. Draw target profile curve (dashed gray)
-  //    - Iterate through profile stages, calculate temp at each time point
-  // 5. Draw actual temperature history (solid, color by stage)
-  //    - Read from Reflow_GetHistory()
-  //    - Use GUI_DrawLine() between consecutive points
-  // 6. Draw current position marker (filled circle)
-  //
-  // Scaling:
-  //   tempMin = 0, tempMax = profile peak + 30
-  //   timeMax = expected duration + 60s margin
-  //   px_per_degree = h / (tempMax - tempMin)
-  //   px_per_second = w / timeMax
+  GUI_SetColor(COLOR_TEXT);
+  _GUI_DispString(5, 5, (uint8_t *)"Reflow Settings");
+  GUI_HLine(0, 25, LCD_WIDTH);
 
-  (void)x; (void)y; (void)w; (void)h;
-}
+  uint16_t y = 40;
+  GUI_SetColor(YELLOW);
+  _GUI_DispString(5, y, (uint8_t *)"Settings editor coming soon.");
+  y += BYTE_HEIGHT + 4;
+  _GUI_DispString(5, y, (uint8_t *)"Current config:");
 
-static void DrawStageIndicator(uint16_t x, uint16_t y)
-{
-  // TODO: Draw current stage name and progress bar
-  //
-  // [Preheat ████████░░ Soak ░░░░░░░░░░ Reflow ░░░░ Peak ░░ Cool]
-  //
-  // Active stage is highlighted, completed stages are filled
+  y += BYTE_HEIGHT + 8;
+  GUI_SetColor(COLOR_TEXT);
 
-  (void)x; (void)y;
-}
+  char str[48];
+  sprintf(str, "SSR Pin: PC12 (PS-ON)  Active: %s",
+          SSR_ACTIVE_LOW ? "LOW" : "HIGH");
+  _GUI_DispString(10, y, (uint8_t *)str);
 
-static void DrawTemperatureDisplay(uint16_t x, uint16_t y)
-{
-  // TODO: Draw current/target temperature and duty cycle
-  //
-  // Current: 183.5°C    Target: 183°C    Duty: 45%
-  // Elapsed: 2:15       Remaining: ~2:15
+  y += BYTE_HEIGHT + 4;
+  sprintf(str, "Fan Pin: PA0 (UART4)   Active: %s",
+          FAN_ACTIVE_LOW ? "LOW" : "HIGH");
+  _GUI_DispString(10, y, (uint8_t *)str);
 
-  (void)x; (void)y;
+  y += BYTE_HEIGHT + 4;
+  sprintf(str, "TC Pins: PB10/PB11/PA15 (UART3+FIL)");
+  _GUI_DispString(10, y, (uint8_t *)str);
+
+  y += BYTE_HEIGHT + 4;
+  sprintf(str, "Safety Max: %.0fC  Runaway: +%.0fC",
+          (double)SAFETY_MAX_TEMP_DEFAULT, (double)SAFETY_THERMAL_RUNAWAY_C);
+  _GUI_DispString(10, y, (uint8_t *)str);
+
+  GUI_SetColor(COLOR_TEXT);
+  GUI_HLine(0, LCD_HEIGHT - (BYTE_HEIGHT * 2), LCD_WIDTH);
+  _GUI_DispStringInRect(0, LCD_HEIGHT - (BYTE_HEIGHT * 2), LCD_WIDTH, LCD_HEIGHT,
+                        (uint8_t *)"Touch to go back");
+
+  while (MENU_IS(menuReflowSettings))
+  {
+    if (KEY_GetValue(1, &fullRect) == 0)
+      CLOSE_MENU();
+
+    loopProcess();
+  }
 }
