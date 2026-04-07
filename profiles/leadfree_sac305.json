@@ -1,0 +1,46 @@
+{
+  "name": "Lead-Free SAC305",
+  "description": "Lead-free solder paste (96.5% tin, 3% silver, 0.5% copper)",
+  "version": 1,
+  "stages": [
+    {
+      "name": "Preheat",
+      "target_temp": 150.0,
+      "ramp_rate": 2.0,
+      "hold_time": 0
+    },
+    {
+      "name": "Soak",
+      "target_temp": 217.0,
+      "ramp_rate": 0.7,
+      "hold_time": 90
+    },
+    {
+      "name": "Reflow",
+      "target_temp": 250.0,
+      "ramp_rate": 2.0,
+      "hold_time": 0
+    },
+    {
+      "name": "Peak",
+      "target_temp": 250.0,
+      "ramp_rate": 0.0,
+      "hold_time": 15
+    },
+    {
+      "name": "Cool",
+      "target_temp": 50.0,
+      "ramp_rate": -3.0,
+      "hold_time": 0
+    }
+  ],
+  "pid": {
+    "kp": 200.0,
+    "ki": 5.0,
+    "kd": 1000.0
+  },
+  "safety": {
+    "max_temp": 280.0,
+    "stage_timeout_multiplier": 3.0
+  }
+}
