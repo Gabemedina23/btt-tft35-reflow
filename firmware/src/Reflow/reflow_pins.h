@@ -7,6 +7,8 @@
 // All pins use EXISTING headers on the board -- no trace cutting required.
 // =============================================================================
 
+#include "GPIO_Init.h"  // for PA0, PB10, PC12, etc. pin macros and GPIO API
+
 // --- MAX6675 Thermocouple (Software SPI) ---
 // Using UART3 header (bottom edge) + FIL-DET header
 #define TC_SCK_PIN   PB10    // UART3 TX pad

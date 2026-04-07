@@ -1,9 +1,7 @@
+#include "includes.h"
 #include "reflow_control.h"
 #include "reflow_pins.h"
 #include "max6675.h"
-#include "GPIO_Init.h"
-#include "os_timer.h"
-#include <string.h>
 #include <math.h>
 
 // =============================================================================

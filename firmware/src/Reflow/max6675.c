@@ -1,8 +1,6 @@
+#include "includes.h"
 #include "max6675.h"
 #include "reflow_pins.h"
-#include "sw_spi.h"
-#include "GPIO_Init.h"
-#include "os_timer.h"
 
 // Software SPI instance for thermocouple
 static _SW_SPI tc_spi;

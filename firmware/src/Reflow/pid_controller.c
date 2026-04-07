@@ -1,5 +1,4 @@
 #include "pid_controller.h"
-#include "reflow_pins.h"
 
 void PID_Init(PID_Controller *pid, float kp, float ki, float kd,
               float outputMin, float outputMax)
