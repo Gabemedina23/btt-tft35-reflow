@@ -55,10 +55,14 @@ static void SSR_UpdatePWM(float dutyCycle)
 
 static bool CheckSafety(void)
 {
+  char logMsg[80];
+
   // Check board thermocouple connection
   if (!MAX6675_IsConnected(TC_BOARD))
   {
     ctrl.error = REFLOW_ERR_SENSOR_OPEN;
+    ReflowLog_Event("ERROR: Board thermocouple disconnected");
+    ReflowLog_Stop();
     return false;
   }
 
@@ -66,6 +70,10 @@ static bool CheckSafety(void)
   if (ctrl.currentTemp > ctrl.profile.maxTemp)
   {
     ctrl.error = REFLOW_ERR_THERMAL_RUNAWAY;
+    sprintf(logMsg, "ERROR: Max temp exceeded (%.1fC > %.1fC max)",
+            (double)ctrl.currentTemp, (double)ctrl.profile.maxTemp);
+    ReflowLog_Event(logMsg);
+    ReflowLog_Stop();
     return false;
   }
 
@@ -75,6 +83,11 @@ static bool CheckSafety(void)
     if (ctrl.currentTemp > ctrl.targetTemp + SAFETY_THERMAL_RUNAWAY_C)
     {
       ctrl.error = REFLOW_ERR_THERMAL_RUNAWAY;
+      sprintf(logMsg, "ERROR: Thermal runaway (%.1fC, target %.1fC, limit +%.0fC)",
+              (double)ctrl.currentTemp, (double)ctrl.targetTemp,
+              (double)SAFETY_THERMAL_RUNAWAY_C);
+      ReflowLog_Event(logMsg);
+      ReflowLog_Stop();
       return false;
     }
   }
@@ -92,6 +105,10 @@ static bool CheckSafety(void)
       if (stageElapsed > timeout && timeout > 0)
       {
         ctrl.error = REFLOW_ERR_STAGE_TIMEOUT;
+        sprintf(logMsg, "ERROR: Stage timeout (%lus > %lus limit, stage %d)",
+                (unsigned long)stageElapsed, (unsigned long)timeout, ctrl.currentStage);
+        ReflowLog_Event(logMsg);
+        ReflowLog_Stop();
         return false;
       }
     }

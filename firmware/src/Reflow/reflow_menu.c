@@ -746,7 +746,7 @@ void menuReflowBurnIn(void)
   PID_Controller burnPid;
   bool needsRedraw = true;
 
-  PID_Init(&burnPid, 3.1f, 0.06f, 42.0f, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
+  PID_Init(&burnPid, 4.1f, 0.03f, 167.2f, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
 
   ReflowLog_Start("burnin");
   char logMsg[48];
