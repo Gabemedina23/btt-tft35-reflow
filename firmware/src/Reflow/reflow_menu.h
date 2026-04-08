@@ -40,7 +40,10 @@ void menuReflowPIDTune(void);
 // Useful for oven testing and thermocouple verification
 void menuReflowMonitor(void);
 
-// Settings menu -- SSR polarity, fan config, safety limits, WiFi
+// Burn-in mode -- hold at 150°C for oven off-gassing
+void menuReflowBurnIn(void);
+
+// Settings menu -- SSR polarity, safety limits, pin config
 void menuReflowSettings(void);
 
 #ifdef __cplusplus

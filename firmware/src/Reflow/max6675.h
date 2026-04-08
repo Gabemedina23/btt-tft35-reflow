@@ -8,6 +8,13 @@ extern "C" {
 #include <stdint.h>
 #include <stdbool.h>
 
+// Thermocouple sensor index
+typedef enum {
+  TC_BOARD = 0,     // TC1: next to the PCB being reflowed (used for PID control)
+  TC_AMBIENT,       // TC2: ambient/chamber temperature
+  TC_COUNT
+} TC_Sensor;
+
 // MAX6675 status flags
 typedef enum {
   TC_OK = 0,              // Valid reading
@@ -23,29 +30,23 @@ typedef struct {
   uint32_t timestamp;     // Tick count when reading was taken
 } TC_Reading;
 
-// Initialize the MAX6675 software SPI interface
+// Initialize both MAX6675 software SPI interfaces
 void MAX6675_Init(void);
 
-// Read raw 16-bit value from MAX6675
-// Returns raw SPI data. Bit 2 = open thermocouple flag.
-uint16_t MAX6675_ReadRaw(void);
-
-// Read temperature with filtering and validation
-// Returns the filtered temperature and updates status
-TC_Reading MAX6675_Read(void);
+// Read temperature from a specific sensor with filtering and validation
+TC_Reading MAX6675_Read(TC_Sensor sensor);
 
 // Get the most recent valid reading without triggering a new SPI read
-// Useful for the display/UI to read without blocking
-TC_Reading MAX6675_GetLastReading(void);
+TC_Reading MAX6675_GetLastReading(TC_Sensor sensor);
 
-// Get the filtered temperature (moving average)
-float MAX6675_GetFilteredTemp(void);
+// Get the filtered temperature (moving average) for a sensor
+float MAX6675_GetFilteredTemp(TC_Sensor sensor);
 
-// Check if sensor is connected and reading valid data
-bool MAX6675_IsConnected(void);
+// Check if a sensor is connected and reading valid data
+bool MAX6675_IsConnected(TC_Sensor sensor);
 
-// Called periodically from the main loop or timer ISR
-// Handles read timing (MAX6675 needs 220ms between conversions)
+// Called periodically from the main loop
+// Handles read timing for both sensors (alternating reads)
 void MAX6675_Update(void);
 
 #ifdef __cplusplus

@@ -2,71 +2,102 @@
 #include "max6675.h"
 #include "reflow_pins.h"
 
-// Software SPI instance for thermocouple
+// =============================================================================
+// Dual MAX6675 driver
+//
+// Both sensors share SCK (PB10) and MISO (PB11) lines.
+// Each has its own CS pin: TC1=PA15 (board), TC2=PA0 (ambient).
+// We alternate reads between sensors each update cycle.
+// =============================================================================
+
+// Software SPI instance (shared bus, CS managed manually)
 static _SW_SPI tc_spi;
 
-// Reading state
-static TC_Reading lastReading = { .temperature = 0.0f, .status = TC_NOT_READY, .timestamp = 0 };
-static float filterBuffer[TC_FILTER_SAMPLES];
-static uint8_t filterIndex = 0;
-static bool filterFilled = false;
+// Per-sensor state
+typedef struct {
+  uint16_t    csPin;
+  TC_Reading  lastReading;
+  float       filterBuffer[TC_FILTER_SAMPLES];
+  uint8_t     filterIndex;
+  bool        filterFilled;
+} TC_SensorState;
+
+static TC_SensorState sensors[TC_COUNT];
 static uint32_t lastReadTime = 0;
+static uint8_t  nextSensor = 0;  // alternates between TC_BOARD and TC_AMBIENT
 
 void MAX6675_Init(void)
 {
-  // Configure software SPI for MAX6675
-  // MAX6675 uses SPI Mode 0 (CPOL=0, CPHA=0), 16-bit reads
+  // Configure shared SPI bus using TC1's CS pin initially
+  // We'll manage CS pins manually for each sensor
   SW_SPI_Config(&tc_spi, _SPI_MODE0, 16,
-                TC_CS_PIN,
+                TC1_CS_PIN,    // CS (will be overridden per-read)
                 TC_SCK_PIN,
                 TC_MISO_PIN,
                 TC_MOSI_PIN);
 
-  // CS starts high (inactive)
-  SW_SPI_CS_Set(&tc_spi, 1);
+  // Both CS pins high (inactive)
+  GPIO_InitSet(TC1_CS_PIN, MGPIO_MODE_OUT_PP, 0);
+  GPIO_InitSet(TC2_CS_PIN, MGPIO_MODE_OUT_PP, 0);
+  GPIO_SetLevel(TC1_CS_PIN, 1);
+  GPIO_SetLevel(TC2_CS_PIN, 1);
 
-  // Initialize filter buffer
-  for (int i = 0; i < TC_FILTER_SAMPLES; i++)
+  // Initialize per-sensor state
+  for (int i = 0; i < TC_COUNT; i++)
   {
-    filterBuffer[i] = 0.0f;
+    sensors[i].lastReading.temperature = 0.0f;
+    sensors[i].lastReading.status = TC_NOT_READY;
+    sensors[i].lastReading.timestamp = 0;
+    sensors[i].filterIndex = 0;
+    sensors[i].filterFilled = false;
+
+    for (int j = 0; j < TC_FILTER_SAMPLES; j++)
+      sensors[i].filterBuffer[j] = 0.0f;
   }
 
-  lastReading.status = TC_NOT_READY;
+  sensors[TC_BOARD].csPin = TC1_CS_PIN;
+  sensors[TC_AMBIENT].csPin = TC2_CS_PIN;
+
   lastReadTime = 0;
+  nextSensor = 0;
 }
 
-uint16_t MAX6675_ReadRaw(void)
+// Read raw 16 bits from a specific sensor's MAX6675
+static uint16_t readRawSensor(TC_Sensor sensor)
 {
-  // Pull CS low to begin read
-  SW_SPI_CS_Set(&tc_spi, 0);
+  uint16_t csPin = sensors[sensor].csPin;
 
-  // Read 16 bits (MAX6675 clocks out data on falling edge of SCK)
+  // Pull CS low to begin read
+  GPIO_SetLevel(csPin, 0);
+  Delay_us(10);
+
+  // Read 16 bits
   uint16_t raw = SW_SPI_Read_Write(&tc_spi, 0x0000);
 
-  // Pull CS high -- this also starts the next conversion (~220ms)
-  SW_SPI_CS_Set(&tc_spi, 1);
+  // Pull CS high — starts next conversion (~220ms)
+  GPIO_SetLevel(csPin, 1);
 
   return raw;
 }
 
-TC_Reading MAX6675_Read(void)
+TC_Reading MAX6675_Read(TC_Sensor sensor)
 {
   TC_Reading reading;
   reading.timestamp = OS_GetTimeMs();
 
-  uint16_t raw = MAX6675_ReadRaw();
+  uint16_t raw = readRawSensor(sensor);
 
   // Bit 2: thermocouple open flag (1 = open / not connected)
   if (raw & 0x04)
   {
     reading.temperature = 0.0f;
     reading.status = TC_OPEN;
-    lastReading = reading;
+    sensors[sensor].lastReading = reading;
     return reading;
   }
 
   // Bits 15-3: 12-bit temperature value, MSB first
-  // Each bit = 0.25C, so divide by 4 to get degrees C
+  // Each bit = 0.25C
   float temp = (float)((raw >> 3) & 0x0FFF) * 0.25f;
 
   // Range validation
@@ -74,55 +105,59 @@ TC_Reading MAX6675_Read(void)
   {
     reading.temperature = temp;
     reading.status = TC_RANGE_ERROR;
-    lastReading = reading;
+    sensors[sensor].lastReading = reading;
     return reading;
   }
 
   // Update moving average filter
-  filterBuffer[filterIndex] = temp;
-  filterIndex = (filterIndex + 1) % TC_FILTER_SAMPLES;
-  if (filterIndex == 0)
-    filterFilled = true;
+  TC_SensorState *s = &sensors[sensor];
+  s->filterBuffer[s->filterIndex] = temp;
+  s->filterIndex = (s->filterIndex + 1) % TC_FILTER_SAMPLES;
+  if (s->filterIndex == 0)
+    s->filterFilled = true;
 
   reading.temperature = temp;
   reading.status = TC_OK;
-  lastReading = reading;
+  s->lastReading = reading;
 
   return reading;
 }
 
-TC_Reading MAX6675_GetLastReading(void)
+TC_Reading MAX6675_GetLastReading(TC_Sensor sensor)
 {
-  return lastReading;
+  return sensors[sensor].lastReading;
 }
 
-float MAX6675_GetFilteredTemp(void)
+float MAX6675_GetFilteredTemp(TC_Sensor sensor)
 {
-  uint8_t count = filterFilled ? TC_FILTER_SAMPLES : filterIndex;
+  TC_SensorState *s = &sensors[sensor];
+  uint8_t count = s->filterFilled ? TC_FILTER_SAMPLES : s->filterIndex;
   if (count == 0)
-    return lastReading.temperature;
+    return s->lastReading.temperature;
 
   float sum = 0.0f;
   for (uint8_t i = 0; i < count; i++)
-  {
-    sum += filterBuffer[i];
-  }
+    sum += s->filterBuffer[i];
+
   return sum / (float)count;
 }
 
-bool MAX6675_IsConnected(void)
+bool MAX6675_IsConnected(TC_Sensor sensor)
 {
-  return (lastReading.status == TC_OK);
+  return (sensors[sensor].lastReading.status == TC_OK);
 }
 
 void MAX6675_Update(void)
 {
   uint32_t now = OS_GetTimeMs();
 
-  // MAX6675 needs ~220ms between conversions. We read at TC_READ_INTERVAL_MS.
+  // Read one sensor per cycle, alternating between board and ambient
+  // Each sensor needs ~250ms between reads, so at 250ms interval
+  // alternating gives each sensor ~500ms between reads (plenty)
   if ((now - lastReadTime) >= TC_READ_INTERVAL_MS)
   {
-    MAX6675_Read();
+    MAX6675_Read(nextSensor);
+    nextSensor = (nextSensor + 1) % TC_COUNT;
     lastReadTime = now;
   }
 }

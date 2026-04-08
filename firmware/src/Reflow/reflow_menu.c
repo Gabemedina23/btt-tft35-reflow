@@ -274,12 +274,10 @@ static void drawStatusBar(const ReflowController *state)
           (unsigned long)((elapsed + remaining) / 60), (unsigned long)((elapsed + remaining) % 60));
   _GUI_DispString(5, y, (uint8_t *)str);
 
-  // Fan indicator
-  if (state->fanOn)
-  {
-    GUI_SetColor(CYAN);
-    _GUI_DispStringRight(LCD_WIDTH - 5, y, (uint8_t *)"FAN ON");
-  }
+  // Ambient temperature
+  GUI_SetColor(CYAN);
+  sprintf(str, "Amb:%.1fC", (double)state->ambientTemp);
+  _GUI_DispStringRight(LCD_WIDTH - 5, y, (uint8_t *)str);
 }
 
 // =============================================================================
@@ -315,12 +313,12 @@ void menuReflowMain(void)
     {
       {ICON_HEAT_FAN,                {.address = (void *)"Start"}},
       {ICON_CUSTOM,                  {.address = (void *)"Profiles"}},
-      {ICON_FEATURE_SETTINGS,        {.address = (void *)"PID Tune"}},
+      {ICON_FEATURE_SETTINGS,        {.address = (void *)"Auto Tune"}},
       {ICON_SCREEN_INFO,             {.address = (void *)"Monitor"}},
       {ICON_SETTINGS,                {.address = (void *)"Settings"}},
+      {ICON_HEAT_FAN,                {.address = (void *)"Burn-In"}},
       {ICON_NULL,                    {.index = LABEL_NULL}},
       {ICON_NULL,                    {.index = LABEL_NULL}},
-      {ICON_BACK,                    {.index = LABEL_BACK}},
     }
   };
 
@@ -346,7 +344,7 @@ void menuReflowMain(void)
         OPEN_MENU(menuReflowProfiles);
         break;
 
-      case KEY_ICON_2:  // PID Tune
+      case KEY_ICON_2:  // Auto Tune
         OPEN_MENU(menuReflowPIDTune);
         break;
 
@@ -358,8 +356,8 @@ void menuReflowMain(void)
         OPEN_MENU(menuReflowSettings);
         break;
 
-      case KEY_ICON_7:  // Back
-        CLOSE_MENU();
+      case KEY_ICON_5:  // Burn-In
+        OPEN_MENU(menuReflowBurnIn);
         break;
 
       default:
@@ -475,7 +473,7 @@ void menuReflowActive(void)
     }
     else if (state->state == REFLOW_ABORTED)
     {
-      Buzzer_Play(SOUND_CANCEL);
+      Buzzer_Play(SOUND_OK);  // short clean beep, not the harsh cancel sound
 
       GUI_SetColor(YELLOW);
       _GUI_DispStringInRect(0, GRAPH_Y + GRAPH_H / 2 - BYTE_HEIGHT,
@@ -549,54 +547,344 @@ void menuReflowProfileEdit(void)
 }
 
 // =============================================================================
-// PID Tuning Menu
+// PID Auto-Tune Menu
 // =============================================================================
 
 void menuReflowPIDTune(void)
 {
   const GUI_RECT fullRect = {0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1};
-  const ReflowController *state = Reflow_GetState();
   char str[64];
+  bool needsRedraw = true;
+
+  AutotuneContext atCtx;
+  Autotune_Init(&atCtx, 150.0f);  // Tune around 150°C (safe for oven)
+  Autotune_Start(&atCtx);
+
+  ReflowLog_Start("autotune");
+  ReflowLog_Event("PID auto-tune started at 150C");
+
+  // SSR already initialized by Reflow_Init() at boot
 
   GUI_Clear(infoSettings.bg_color);
-  setMenu(MENU_TYPE_OTHER, NULL, 1, &fullRect, NULL, NULL);
-
-  GUI_SetColor(COLOR_TEXT);
-  _GUI_DispString(5, 5, (uint8_t *)"PID Tuning");
-  GUI_HLine(0, 25, LCD_WIDTH);
-
-  // Display current PID values
-  uint16_t y = 35;
-  sprintf(str, "Kp: %.1f", (double)state->profile.pidKp);
-  _GUI_DispString(5, y, (uint8_t *)str);
-
-  y += BYTE_HEIGHT + 4;
-  sprintf(str, "Ki: %.1f", (double)state->profile.pidKi);
-  _GUI_DispString(5, y, (uint8_t *)str);
-
-  y += BYTE_HEIGHT + 4;
-  sprintf(str, "Kd: %.1f", (double)state->profile.pidKd);
-  _GUI_DispString(5, y, (uint8_t *)str);
-
-  y += BYTE_HEIGHT + 8;
-  GUI_SetColor(YELLOW);
-  _GUI_DispString(5, y, (uint8_t *)"PID editor coming soon.");
-  y += BYTE_HEIGHT + 4;
-  _GUI_DispString(5, y, (uint8_t *)"Use Monitor mode to test oven response.");
-
-  // Bottom: touch to exit
-  GUI_SetColor(COLOR_TEXT);
-  GUI_HLine(0, LCD_HEIGHT - (BYTE_HEIGHT * 2), LCD_WIDTH);
-  _GUI_DispStringInRect(0, LCD_HEIGHT - (BYTE_HEIGHT * 2), LCD_WIDTH, LCD_HEIGHT,
-                        (uint8_t *)"Touch to go back");
+  setMenu(MENU_TYPE_FULLSCREEN, NULL, 1, &fullRect, NULL, NULL);
 
   while (MENU_IS(menuReflowPIDTune))
   {
+    // Update thermocouples
+    MAX6675_Update();
+    float boardTemp = MAX6675_GetFilteredTemp(TC_BOARD);
+    float ambientTemp = MAX6675_GetFilteredTemp(TC_AMBIENT);
+
+    // Run auto-tune relay logic
+    float duty = Autotune_Update(&atCtx, boardTemp);
+
+    // Apply SSR PWM
+    static uint32_t ssrStart = 0;
+    uint32_t now = OS_GetTimeMs();
+    if ((now - ssrStart) >= PID_SSR_PERIOD_MS) ssrStart = now;
+    uint32_t onTime = (uint32_t)(duty * PID_SSR_PERIOD_MS / 100.0f);
+    bool ssrOn = ((now - ssrStart) < onTime);
+    GPIO_SetLevel(SSR_PIN, SSR_ACTIVE_LOW ? (ssrOn ? 0 : 1) : (ssrOn ? 1 : 0));
+
+    // Log data
+    static uint32_t lastLogTime = 0;
+    if ((now - lastLogTime) >= 1000)
+    {
+      const char *stateStr =
+        atCtx.state == AUTOTUNE_HEATING ? "Heating" :
+        atCtx.state == AUTOTUNE_RELAY_ON ? "RelayON" :
+        atCtx.state == AUTOTUNE_RELAY_OFF ? "RelayOFF" : "Done";
+      sprintf(str, "cycle%d", atCtx.cycleCount);
+      ReflowLog_Write(boardTemp, ambientTemp, atCtx.targetTemp, duty, stateStr, str);
+      lastLogTime = now;
+    }
+
+    // Check for abort (touch)
     if (KEY_GetValue(1, &fullRect) == 0)
-      CLOSE_MENU();
+    {
+      if (!Autotune_IsRunning(&atCtx))
+      {
+        // Done or error — exit
+        GPIO_SetLevel(SSR_PIN, SSR_ACTIVE_LOW ? 1 : 0);  // SSR off
+        ReflowLog_Stop();
+        CLOSE_MENU();
+        break;
+      }
+      else
+      {
+        // Abort
+        Autotune_Abort(&atCtx);
+        GPIO_SetLevel(SSR_PIN, SSR_ACTIVE_LOW ? 1 : 0);
+        ReflowLog_Event("Auto-tune aborted");
+        ReflowLog_Stop();
+        Buzzer_Play(SOUND_OK);
+      }
+    }
+
+    // Encoder click = abort
+    if (LCD_Enc_ReadBtn(200) && Autotune_IsRunning(&atCtx))
+    {
+      Autotune_Abort(&atCtx);
+      GPIO_SetLevel(SSR_PIN, SSR_ACTIVE_LOW ? 1 : 0);
+      ReflowLog_Event("Auto-tune aborted");
+      ReflowLog_Stop();
+      Buzzer_Play(SOUND_OK);
+    }
+
+    // Refresh display
+    if (nextScreenUpdate(500) || needsRedraw)
+    {
+      needsRedraw = false;
+
+      GUI_SetColor(infoSettings.bg_color);
+      GUI_FillRect(0, 0, LCD_WIDTH, LCD_HEIGHT);
+
+      GUI_SetColor(COLOR_TEXT);
+      _GUI_DispString(5, 5, (uint8_t *)"PID Auto-Tune");
+      GUI_HLine(0, 28, LCD_WIDTH);
+
+      uint16_t y = 35;
+
+      // Status
+      GUI_SetColor(YELLOW);
+      const char *stateStr =
+        atCtx.state == AUTOTUNE_HEATING ? "Heating to target..." :
+        atCtx.state == AUTOTUNE_RELAY_ON ? "Relay ON (heating)" :
+        atCtx.state == AUTOTUNE_RELAY_OFF ? "Relay OFF (cooling)" :
+        atCtx.state == AUTOTUNE_COMPLETE ? "COMPLETE!" :
+        atCtx.state == AUTOTUNE_ERROR ? "TIMEOUT ERROR" : "Idle";
+      _GUI_DispString(10, y, (uint8_t *)stateStr);
+
+      // Temperatures
+      y += BYTE_HEIGHT + 8;
+      GUI_SetColor(GREEN);
+      sprintf(str, "Board: %.1f C    Target: %.0f C", (double)boardTemp, (double)atCtx.targetTemp);
+      _GUI_DispString(10, y, (uint8_t *)str);
+
+      y += BYTE_HEIGHT + 4;
+      GUI_SetColor(CYAN);
+      sprintf(str, "Ambient: %.1f C  Duty: %.0f%%", (double)ambientTemp, (double)duty);
+      _GUI_DispString(10, y, (uint8_t *)str);
+
+      // Cycle info
+      y += BYTE_HEIGHT + 8;
+      GUI_SetColor(COLOR_TEXT);
+      sprintf(str, "Cycles: %d / %d    Peaks: %d  Valleys: %d",
+              atCtx.cycleCount, atCtx.minCycles, atCtx.peakCount, atCtx.valleyCount);
+      _GUI_DispString(10, y, (uint8_t *)str);
+
+      // Results (if complete)
+      if (atCtx.state == AUTOTUNE_COMPLETE)
+      {
+        y += BYTE_HEIGHT + 8;
+        GUI_SetColor(GREEN);
+        _GUI_DispString(10, y, (uint8_t *)"Results:");
+
+        y += BYTE_HEIGHT + 4;
+        sprintf(str, "  Ku=%.1f  Tu=%.1fs", (double)atCtx.Ku, (double)atCtx.Tu);
+        _GUI_DispString(10, y, (uint8_t *)str);
+
+        y += BYTE_HEIGHT + 4;
+        sprintf(str, "  Kp=%.1f  Ki=%.2f  Kd=%.1f",
+                (double)atCtx.resultKp, (double)atCtx.resultKi, (double)atCtx.resultKd);
+        _GUI_DispString(10, y, (uint8_t *)str);
+
+        y += BYTE_HEIGHT + 8;
+        GUI_SetColor(YELLOW);
+        _GUI_DispString(10, y, (uint8_t *)"Touch to exit. Update profiles with these values.");
+
+        char logMsg[64];
+        sprintf(logMsg, "Kp=%.1f Ki=%.2f Kd=%.1f", (double)atCtx.resultKp,
+                (double)atCtx.resultKi, (double)atCtx.resultKd);
+        ReflowLog_Event(logMsg);
+        ReflowLog_Stop();
+
+        Buzzer_Play(SOUND_SUCCESS);
+      }
+      else if (atCtx.state == AUTOTUNE_ERROR)
+      {
+        y += BYTE_HEIGHT + 8;
+        GUI_SetColor(RED);
+        _GUI_DispString(10, y, (uint8_t *)"Auto-tune timed out. Touch to exit.");
+      }
+      else
+      {
+        // Running — show touch to abort
+        GUI_SetColor(COLOR_TEXT);
+        GUI_HLine(0, LCD_HEIGHT - (BYTE_HEIGHT * 2), LCD_WIDTH);
+        _GUI_DispStringInRect(0, LCD_HEIGHT - (BYTE_HEIGHT * 2), LCD_WIDTH, LCD_HEIGHT,
+                              (uint8_t *)"Touch or click encoder to abort");
+      }
+    }
 
     loopProcess();
   }
+}
+
+// =============================================================================
+// Burn-In Mode (off-gas oven at 150°C)
+// =============================================================================
+
+void menuReflowBurnIn(void)
+{
+  const GUI_RECT fullRect = {0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1};
+  char str[64];
+  bool running = true;
+  float targetTemp = 150.0f;
+  float dutyCycle = 0.0f;
+  PID_Controller burnPid;
+  bool needsRedraw = true;
+
+  PID_Init(&burnPid, 200.0f, 5.0f, 1000.0f, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
+
+  ReflowLog_Start("burnin");
+  char logMsg[48];
+  sprintf(logMsg, "Burn-in started at %.0fC", (double)targetTemp);
+  ReflowLog_Event(logMsg);
+
+  // SSR already initialized by Reflow_Init() at boot
+
+  GUI_Clear(infoSettings.bg_color);
+  setMenu(MENU_TYPE_FULLSCREEN, NULL, 1, &fullRect, NULL, NULL);
+
+  uint32_t startTime = OS_GetTimeMs();
+  uint32_t lastPidTime = OS_GetTimeMs();
+
+  while (MENU_IS(menuReflowBurnIn))
+  {
+    MAX6675_Update();
+    float boardTemp = MAX6675_GetFilteredTemp(TC_BOARD);
+    float ambientTemp = MAX6675_GetFilteredTemp(TC_AMBIENT);
+    uint32_t now = OS_GetTimeMs();
+
+    // PID control at 2Hz
+    if (running && (now - lastPidTime) >= PID_UPDATE_INTERVAL_MS)
+    {
+      float dt = (float)(now - lastPidTime) / 1000.0f;
+      lastPidTime = now;
+
+      if (boardTemp < targetTemp - 10.0f)
+        dutyCycle = PID_OUTPUT_MAX;
+      else
+        dutyCycle = PID_Compute(&burnPid, boardTemp, targetTemp, dt);
+
+      // Log every second (alternating with PID at 2Hz)
+      static bool logToggle = false;
+      logToggle = !logToggle;
+      if (logToggle)
+        ReflowLog_Write(boardTemp, ambientTemp, targetTemp, dutyCycle, "BurnIn", "Hold");
+    }
+
+    // SSR PWM
+    if (running)
+    {
+      static uint32_t ssrStart = 0;
+      if ((now - ssrStart) >= PID_SSR_PERIOD_MS) ssrStart = now;
+      uint32_t onTime = (uint32_t)(dutyCycle * PID_SSR_PERIOD_MS / 100.0f);
+      bool ssrOn = ((now - ssrStart) < onTime);
+      GPIO_SetLevel(SSR_PIN, SSR_ACTIVE_LOW ? (ssrOn ? 0 : 1) : (ssrOn ? 1 : 0));
+    }
+    else
+    {
+      GPIO_SetLevel(SSR_PIN, SSR_ACTIVE_LOW ? 1 : 0);
+    }
+
+    // Check for stop (touch or encoder)
+    if (KEY_GetValue(1, &fullRect) == 0 || LCD_Enc_ReadBtn(200))
+    {
+      if (running)
+      {
+        running = false;
+        dutyCycle = 0.0f;
+        GPIO_SetLevel(SSR_PIN, SSR_ACTIVE_LOW ? 1 : 0);
+        ReflowLog_Event("Burn-in stopped by user");
+        ReflowLog_Stop();
+        Buzzer_Play(SOUND_OK);
+      }
+      else
+      {
+        CLOSE_MENU();
+        break;
+      }
+    }
+
+    // Refresh display
+    if (nextScreenUpdate(500) || needsRedraw)
+    {
+      needsRedraw = false;
+      uint32_t elapsed = (now - startTime) / 1000;
+
+      GUI_SetColor(infoSettings.bg_color);
+      GUI_FillRect(0, 0, LCD_WIDTH, LCD_HEIGHT);
+
+      GUI_SetColor(COLOR_TEXT);
+      _GUI_DispString(5, 5, (uint8_t *)"Oven Burn-In (Off-Gas Mode)");
+      GUI_HLine(0, 28, LCD_WIDTH);
+
+      uint16_t y = 40;
+
+      // Large temp display
+      GUI_SetColor(running ? GREEN : YELLOW);
+      sprintf(str, "Board: %.1f C", (double)boardTemp);
+      _GUI_DispString(10, y, (uint8_t *)str);
+      sprintf(str, "/ %.0f C", (double)targetTemp);
+      _GUI_DispString(220, y, (uint8_t *)str);
+
+      y += BYTE_HEIGHT + 8;
+      GUI_SetColor(CYAN);
+      sprintf(str, "Ambient: %.1f C", (double)ambientTemp);
+      _GUI_DispString(10, y, (uint8_t *)str);
+
+      y += BYTE_HEIGHT + 4;
+      GUI_SetColor(COLOR_TEXT);
+      sprintf(str, "Duty: %.0f%%    SSR: %s", (double)dutyCycle, running ? "ACTIVE" : "OFF");
+      _GUI_DispString(10, y, (uint8_t *)str);
+
+      y += BYTE_HEIGHT + 4;
+      sprintf(str, "Elapsed: %lu:%02lu:%02lu",
+              (unsigned long)(elapsed / 3600),
+              (unsigned long)((elapsed % 3600) / 60),
+              (unsigned long)(elapsed % 60));
+      _GUI_DispString(10, y, (uint8_t *)str);
+
+      y += BYTE_HEIGHT + 8;
+      if (running)
+      {
+        GUI_SetColor(YELLOW);
+        _GUI_DispString(10, y, (uint8_t *)"Let oven run until smoke stops.");
+        y += BYTE_HEIGHT + 4;
+        _GUI_DispString(10, y, (uint8_t *)"Open a window or do this in garage!");
+      }
+      else
+      {
+        GUI_SetColor(GREEN);
+        _GUI_DispString(10, y, (uint8_t *)"Burn-in stopped. Oven cooling.");
+        y += BYTE_HEIGHT + 4;
+        _GUI_DispString(10, y, (uint8_t *)"Touch again to exit.");
+      }
+
+      // Logging indicator
+      y += BYTE_HEIGHT + 8;
+      if (ReflowLog_IsActive())
+      {
+        GUI_SetColor(GREEN);
+        sprintf(str, "Logging to: %s", ReflowLog_GetFilename());
+        _GUI_DispString(10, y, (uint8_t *)str);
+      }
+
+      // Bottom bar
+      GUI_SetColor(COLOR_TEXT);
+      GUI_HLine(0, LCD_HEIGHT - (BYTE_HEIGHT * 2), LCD_WIDTH);
+      _GUI_DispStringInRect(0, LCD_HEIGHT - (BYTE_HEIGHT * 2), LCD_WIDTH, LCD_HEIGHT,
+                            (uint8_t *)(running ? "Touch to stop burn-in" : "Touch to exit"));
+    }
+
+    loopProcess();
+  }
+
+  // Make sure SSR is off when leaving
+  GPIO_SetLevel(SSR_PIN, SSR_ACTIVE_LOW ? 1 : 0);
+  if (ReflowLog_IsActive()) ReflowLog_Stop();
 }
 
 // =============================================================================
@@ -606,8 +894,7 @@ void menuReflowPIDTune(void)
 void menuReflowMonitor(void)
 {
   const GUI_RECT fullRect = {0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1};
-  char str[32];
-  float minTemp = 9999.0f, maxTemp = -1.0f;
+  char str[48];
   bool firstDraw = true;
 
   GUI_Clear(infoSettings.bg_color);
@@ -615,7 +902,6 @@ void menuReflowMonitor(void)
 
   while (MENU_IS(menuReflowMonitor))
   {
-    // Update thermocouple
     Reflow_Update();
 
     if (KEY_GetValue(1, &fullRect) == 0)
@@ -627,14 +913,10 @@ void menuReflowMonitor(void)
     if (nextScreenUpdate(500) || firstDraw)
     {
       firstDraw = false;
-      TC_Reading reading = MAX6675_GetLastReading();
-      float temp = MAX6675_GetFilteredTemp();
-
-      if (reading.status == TC_OK)
-      {
-        if (temp < minTemp) minTemp = temp;
-        if (temp > maxTemp) maxTemp = temp;
-      }
+      TC_Reading boardReading = MAX6675_GetLastReading(TC_BOARD);
+      TC_Reading ambientReading = MAX6675_GetLastReading(TC_AMBIENT);
+      float boardTemp = MAX6675_GetFilteredTemp(TC_BOARD);
+      float ambientTemp = MAX6675_GetFilteredTemp(TC_AMBIENT);
 
       // Clear display area
       GUI_SetColor(infoSettings.bg_color);
@@ -643,54 +925,74 @@ void menuReflowMonitor(void)
       // Title
       GUI_SetColor(COLOR_TEXT);
       _GUI_DispString(5, 5, (uint8_t *)"Temperature Monitor");
-      GUI_HLine(0, 25, LCD_WIDTH);
+      GUI_HLine(0, 28, LCD_WIDTH);
 
-      // Large temperature display
-      if (reading.status == TC_OK)
+      // === Board Thermocouple (TC1) ===
+      uint16_t y = 38;
+      GUI_SetColor(YELLOW);
+      _GUI_DispString(10, y, (uint8_t *)"BOARD (TC1) - PID control");
+
+      y += BYTE_HEIGHT + 4;
+      if (boardReading.status == TC_OK)
       {
         GUI_SetColor(GREEN);
-        sprintf(str, "%.1f C", (double)temp);
-        // Draw large (use available font)
-        GUI_SetColor(GREEN);
-        _GUI_DispStringCenter(LCD_WIDTH / 2, 60, (uint8_t *)str);
+        sprintf(str, "  %.1f C", (double)boardTemp);
       }
-      else if (reading.status == TC_OPEN)
+      else if (boardReading.status == TC_OPEN)
       {
         GUI_SetColor(RED);
-        _GUI_DispStringCenter(LCD_WIDTH / 2, 60, (uint8_t *)"OPEN - No thermocouple");
+        sprintf(str, "  OPEN - Not connected");
       }
       else
       {
         GUI_SetColor(YELLOW);
-        _GUI_DispStringCenter(LCD_WIDTH / 2, 60, (uint8_t *)"Reading...");
+        sprintf(str, "  Reading...");
       }
+      _GUI_DispString(10, y, (uint8_t *)str);
 
-      // Stats
+      y += BYTE_HEIGHT + 4;
       GUI_SetColor(COLOR_TEXT);
-      uint16_t y = 120;
+      sprintf(str, "  Status: %s  Raw: %.2f C",
+              boardReading.status == TC_OK ? "OK" :
+              boardReading.status == TC_OPEN ? "OPEN" : "ERR",
+              (double)boardReading.temperature);
+      _GUI_DispString(10, y, (uint8_t *)str);
 
-      sprintf(str, "Status: %s",
-              reading.status == TC_OK ? "Connected" :
-              reading.status == TC_OPEN ? "DISCONNECTED" : "Error");
-      _GUI_DispString(20, y, (uint8_t *)str);
+      // Divider
+      y += BYTE_HEIGHT + 8;
+      GUI_SetColor(COLOR_GRID);
+      GUI_HLine(10, y, LCD_WIDTH - 10);
+      y += 8;
+
+      // === Ambient Thermocouple (TC2) ===
+      GUI_SetColor(CYAN);
+      _GUI_DispString(10, y, (uint8_t *)"AMBIENT (TC2) - Chamber temp");
 
       y += BYTE_HEIGHT + 4;
-      if (minTemp < 9000.0f)
+      if (ambientReading.status == TC_OK)
       {
-        sprintf(str, "Min: %.1f C", (double)minTemp);
-        _GUI_DispString(20, y, (uint8_t *)str);
+        GUI_SetColor(GREEN);
+        sprintf(str, "  %.1f C", (double)ambientTemp);
       }
-
-      y += BYTE_HEIGHT + 4;
-      if (maxTemp > -0.5f)
+      else if (ambientReading.status == TC_OPEN)
       {
-        sprintf(str, "Max: %.1f C", (double)maxTemp);
-        _GUI_DispString(20, y, (uint8_t *)str);
+        GUI_SetColor(RED);
+        sprintf(str, "  OPEN - Not connected");
       }
+      else
+      {
+        GUI_SetColor(YELLOW);
+        sprintf(str, "  Reading...");
+      }
+      _GUI_DispString(10, y, (uint8_t *)str);
 
       y += BYTE_HEIGHT + 4;
-      sprintf(str, "Raw: %.2f C", (double)reading.temperature);
-      _GUI_DispString(20, y, (uint8_t *)str);
+      GUI_SetColor(COLOR_TEXT);
+      sprintf(str, "  Status: %s  Raw: %.2f C",
+              ambientReading.status == TC_OK ? "OK" :
+              ambientReading.status == TC_OPEN ? "OPEN" : "ERR",
+              (double)ambientReading.temperature);
+      _GUI_DispString(10, y, (uint8_t *)str);
 
       // Bottom: touch to exit
       GUI_SetColor(COLOR_TEXT);
@@ -733,13 +1035,10 @@ void menuReflowSettings(void)
   _GUI_DispString(10, y, (uint8_t *)str);
 
   y += BYTE_HEIGHT + 4;
-  sprintf(str, "Fan Pin: PA0 (UART4)   Active: %s",
-          FAN_ACTIVE_LOW ? "LOW" : "HIGH");
-  _GUI_DispString(10, y, (uint8_t *)str);
+  _GUI_DispString(10, y, (uint8_t *)"TC1 Board:   PB10/PB11/PA15 (UART3+FIL)");
 
   y += BYTE_HEIGHT + 4;
-  sprintf(str, "TC Pins: PB10/PB11/PA15 (UART3+FIL)");
-  _GUI_DispString(10, y, (uint8_t *)str);
+  _GUI_DispString(10, y, (uint8_t *)"TC2 Ambient: PB10/PB11/PA0  (UART3+UART4)");
 
   y += BYTE_HEIGHT + 4;
   sprintf(str, "Safety Max: %.0fC  Runaway: +%.0fC",

@@ -49,14 +49,15 @@ typedef struct {
   ReflowProfile   profile;        // Active profile (copied so user can modify)
   PID_Controller  pid;
   uint8_t         currentStage;   // Index into profile.stages[]
-  float           currentTemp;    // Latest thermocouple reading (C)
+  float           currentTemp;    // Board thermocouple reading (C) — used for PID
+  float           ambientTemp;    // Ambient/chamber thermocouple reading (C)
   float           targetTemp;     // Current target for display
   float           dutyCycle;      // SSR duty cycle (0-100%)
   uint32_t        stageStartTime; // Tick when current stage began (ms)
   uint32_t        profileStartTime; // Tick when profile started (ms)
   uint32_t        lastPidTime;    // Tick of last PID computation
-  bool            fanOn;          // Cooling fan state
-  TempHistory     history;        // Temperature log for graphing
+  TempHistory     history;        // Temperature log for graphing (board TC)
+  TempHistory     ambientHistory; // Temperature log for graphing (ambient TC)
 } ReflowController;
 
 // --- Lifecycle ---
@@ -79,14 +80,11 @@ void Reflow_Abort(void);
 // Reset to idle state (clear error, ready for next run)
 void Reflow_Reset(void);
 
-// --- SSR and Fan hardware control ---
+// --- SSR hardware control ---
 
 // Set SSR output (called by PID loop)
 // dutyCycle: 0.0 = always off, 100.0 = always on
 void Reflow_SetSSR(float dutyCycle);
-
-// Set cooling fan state
-void Reflow_SetFan(bool on);
 
 // --- Status queries ---
 

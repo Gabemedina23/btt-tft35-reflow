@@ -29,26 +29,8 @@ static void SSR_Set(bool on)
     GPIO_SetLevel(SSR_PIN, on ? 1 : 0);
 }
 
-static void Fan_Init(void)
-{
-  GPIO_InitSet(FAN_PIN, MGPIO_MODE_OUT_PP, 0);
-  GPIO_SetLevel(FAN_PIN, FAN_ACTIVE_LOW ? 1 : 0);  // Start OFF
-}
-
-static void Fan_Set(bool on)
-{
-  if (FAN_ACTIVE_LOW)
-    GPIO_SetLevel(FAN_PIN, on ? 0 : 1);
-  else
-    GPIO_SetLevel(FAN_PIN, on ? 1 : 0);
-}
-
 // =============================================================================
 // SSR Software PWM
-//
-// The SSR is switched at a 1-second period. dutyCycle (0-100) determines
-// what fraction of the period the SSR is ON. This provides proportional
-// power control suitable for zero-crossing SSRs.
 // =============================================================================
 
 static void SSR_UpdatePWM(float dutyCycle)
@@ -73,8 +55,8 @@ static void SSR_UpdatePWM(float dutyCycle)
 
 static bool CheckSafety(void)
 {
-  // Check thermocouple connection
-  if (!MAX6675_IsConnected())
+  // Check board thermocouple connection
+  if (!MAX6675_IsConnected(TC_BOARD))
   {
     ctrl.error = REFLOW_ERR_SENSOR_OPEN;
     return false;
@@ -128,7 +110,6 @@ static void EnterStage(uint8_t stageIndex)
   ctrl.stageStartTime = OS_GetTimeMs();
   ctrl.targetTemp = ctrl.profile.stages[stageIndex].targetTemp;
 
-  // Reset PID integral when entering a new stage to avoid windup carryover
   PID_Reset(&ctrl.pid);
   PID_SetGains(&ctrl.pid, ctrl.profile.pidKp, ctrl.profile.pidKi, ctrl.profile.pidKd);
 }
@@ -139,20 +120,22 @@ static void AdvanceStage(void)
 
   if (nextStage >= ctrl.profile.numStages)
   {
-    // Profile complete
     ctrl.state = REFLOW_COMPLETE;
     ctrl.dutyCycle = 0.0f;
     SSR_Set(false);
-    Reflow_SetFan(false);
+    ReflowLog_Event("Profile complete");
+    ReflowLog_Stop();
     return;
   }
 
   EnterStage(nextStage);
 
-  // Determine state from stage name/characteristics
   const ReflowStage *stage = &ctrl.profile.stages[nextStage];
   if (stage->rampRate < 0.0f)
+  {
     ctrl.state = REFLOW_COOL;
+    Buzzer_Play(SOUND_NOTIFY);  // Beep to signal "open the door!"
+  }
   else if (stage->rampRate == 0.0f && stage->holdTime > 0)
     ctrl.state = REFLOW_PEAK;
   else if (stage->holdTime > 0)
@@ -165,12 +148,12 @@ static void AdvanceStage(void)
 // Record temperature for graphing
 // =============================================================================
 
-static void RecordTemperature(float temp)
+static void RecordTemperature(TempHistory *hist, float temp)
 {
-  ctrl.history.samples[ctrl.history.head] = temp;
-  ctrl.history.head = (ctrl.history.head + 1) % TEMP_HISTORY_SIZE;
-  if (ctrl.history.count < TEMP_HISTORY_SIZE)
-    ctrl.history.count++;
+  hist->samples[hist->head] = temp;
+  hist->head = (hist->head + 1) % TEMP_HISTORY_SIZE;
+  if (hist->count < TEMP_HISTORY_SIZE)
+    hist->count++;
 }
 
 // =============================================================================
@@ -183,21 +166,19 @@ void Reflow_Init(void)
   ctrl.state = REFLOW_IDLE;
   ctrl.error = REFLOW_ERR_NONE;
 
-  // Initialize hardware
   MAX6675_Init();
   SSR_Init();
-  Fan_Init();
 
-  // Initialize PID with default values (will be overwritten when profile starts)
   PID_Init(&ctrl.pid, 200.0f, 5.0f, 1000.0f, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
-  PID_SetFeedForward(&ctrl.pid, 10.0f);  // Default feed-forward gain
+  PID_SetFeedForward(&ctrl.pid, 10.0f);
 }
 
 void Reflow_Update(void)
 {
-  // Always update thermocouple readings
+  // Always update thermocouple readings (both sensors)
   MAX6675_Update();
-  ctrl.currentTemp = MAX6675_GetFilteredTemp();
+  ctrl.currentTemp = MAX6675_GetFilteredTemp(TC_BOARD);
+  ctrl.ambientTemp = MAX6675_GetFilteredTemp(TC_AMBIENT);
 
   // SSR PWM runs continuously based on current duty cycle
   if (ctrl.state != REFLOW_IDLE && ctrl.state != REFLOW_COMPLETE &&
@@ -207,10 +188,10 @@ void Reflow_Update(void)
   }
   else
   {
-    SSR_Set(false);  // Ensure heater is off in non-active states
+    SSR_Set(false);
   }
 
-  // State machine only needs to run at PID rate (1 Hz)
+  // State machine runs at PID rate (1 Hz)
   uint32_t now = OS_GetTimeMs();
   if ((now - ctrl.lastPidTime) < PID_UPDATE_INTERVAL_MS)
     return;
@@ -218,10 +199,19 @@ void Reflow_Update(void)
   float dt = (float)(now - ctrl.lastPidTime) / 1000.0f;
   ctrl.lastPidTime = now;
 
-  // Record temperature for graph (1 sample per PID cycle = 1/s)
-  if (ctrl.state >= REFLOW_PREHEAT && ctrl.state <= REFLOW_COOL)
+  // Record temperatures for graph (~1 sample per second)
+  static bool recordToggle = false;
+  recordToggle = !recordToggle;
+  if (recordToggle && ctrl.state >= REFLOW_PREHEAT && ctrl.state <= REFLOW_COOL)
   {
-    RecordTemperature(ctrl.currentTemp);
+    RecordTemperature(&ctrl.history, ctrl.currentTemp);
+    RecordTemperature(&ctrl.ambientHistory, ctrl.ambientTemp);
+
+    // Log to SD card
+    const char *stageName = (ctrl.currentStage < ctrl.profile.numStages) ?
+                            ctrl.profile.stages[ctrl.currentStage].name : "";
+    ReflowLog_Write(ctrl.currentTemp, ctrl.ambientTemp, ctrl.targetTemp,
+                    ctrl.dutyCycle, Reflow_GetStateName(ctrl.state), stageName);
   }
 
   // State machine
@@ -236,21 +226,22 @@ void Reflow_Update(void)
     case REFLOW_ERROR:
       ctrl.dutyCycle = 0.0f;
       SSR_Set(false);
-      Reflow_SetFan(true);  // Turn on fan to cool down safely
       break;
 
     case REFLOW_PREHEAT:
     case REFLOW_RAMP:
     {
-      // Safety check
       if (!CheckSafety()) { ctrl.state = REFLOW_ERROR; break; }
 
       const ReflowStage *stage = &ctrl.profile.stages[ctrl.currentStage];
 
-      // During preheat/ramp: use bang-bang until within 20C of target, then PID
-      if (ctrl.currentTemp < stage->targetTemp - 20.0f)
+      // Full power until within 10C of target, then PID takes over
+      if (ctrl.currentTemp < stage->targetTemp - 10.0f)
       {
-        ctrl.dutyCycle = PID_OUTPUT_MAX;  // Full power
+        ctrl.dutyCycle = PID_OUTPUT_MAX;
+        // Keep PID primed so transition is smooth
+        PID_Reset(&ctrl.pid);
+        ctrl.pid.output = PID_OUTPUT_MAX;
       }
       else
       {
@@ -263,17 +254,14 @@ void Reflow_Update(void)
       {
         if (stage->holdTime > 0)
         {
-          // This stage has a hold -- transition to soak/peak
           ctrl.state = (stage->rampRate == 0.0f) ? REFLOW_PEAK : REFLOW_SOAK;
-          ctrl.stageStartTime = OS_GetTimeMs();  // Reset for hold timing
+          ctrl.stageStartTime = OS_GetTimeMs();
         }
         else
         {
           AdvanceStage();
         }
       }
-
-      ctrl.fanOn = false;
       break;
     }
 
@@ -284,34 +272,27 @@ void Reflow_Update(void)
 
       const ReflowStage *stage = &ctrl.profile.stages[ctrl.currentStage];
 
-      // PID to hold at target temperature
       ctrl.dutyCycle = PID_Compute(&ctrl.pid, ctrl.currentTemp, stage->targetTemp, dt);
 
-      // Check if hold time has elapsed
       uint32_t holdElapsed = (OS_GetTimeMs() - ctrl.stageStartTime) / 1000;
       if (holdElapsed >= stage->holdTime)
       {
         AdvanceStage();
       }
-
-      ctrl.fanOn = false;
       break;
     }
 
     case REFLOW_COOL:
     {
-      // Heater off, fan on
+      // Heater off, door open for passive cooling (no fan)
       ctrl.dutyCycle = 0.0f;
       SSR_Set(false);
-      Reflow_SetFan(true);
-      ctrl.fanOn = true;
 
       const ReflowStage *stage = &ctrl.profile.stages[ctrl.currentStage];
 
-      // Check if we've cooled to target
       if (ctrl.currentTemp <= stage->targetTemp)
       {
-        AdvanceStage();  // Will set state to REFLOW_COMPLETE if last stage
+        AdvanceStage();
       }
       break;
     }
@@ -323,27 +304,28 @@ void Reflow_Update(void)
 
 void Reflow_Start(const ReflowProfile *profile)
 {
-  // Copy profile so we can modify PID values during tuning
   memcpy(&ctrl.profile, profile, sizeof(ReflowProfile));
 
-  // Reset state
   ctrl.state = REFLOW_PREHEAT;
   ctrl.error = REFLOW_ERR_NONE;
   ctrl.profileStartTime = OS_GetTimeMs();
   ctrl.lastPidTime = OS_GetTimeMs();
-  ctrl.dutyCycle = 0.0f;
-  ctrl.fanOn = false;
+  ctrl.dutyCycle = PID_OUTPUT_MAX;  // Start at full power immediately
 
-  // Clear history
+  // Start SD card logging
+  ReflowLog_Start("reflow");
+  ReflowLog_Event(ctrl.profile.name);
+
+  // Clear history for both sensors
   ctrl.history.head = 0;
   ctrl.history.count = 0;
+  ctrl.ambientHistory.head = 0;
+  ctrl.ambientHistory.count = 0;
 
-  // Initialize PID with profile parameters
   PID_Init(&ctrl.pid, profile->pidKp, profile->pidKi, profile->pidKd,
            PID_OUTPUT_MIN, PID_OUTPUT_MAX);
   PID_SetFeedForward(&ctrl.pid, 10.0f);
 
-  // Enter first stage
   EnterStage(0);
 }
 
@@ -352,7 +334,8 @@ void Reflow_Abort(void)
   ctrl.state = REFLOW_ABORTED;
   ctrl.dutyCycle = 0.0f;
   SSR_Set(false);
-  Reflow_SetFan(true);  // Cool down after abort
+  ReflowLog_Event("Aborted by user");
+  ReflowLog_Stop();
 }
 
 void Reflow_Reset(void)
@@ -360,20 +343,12 @@ void Reflow_Reset(void)
   ctrl.state = REFLOW_IDLE;
   ctrl.error = REFLOW_ERR_NONE;
   ctrl.dutyCycle = 0.0f;
-  ctrl.fanOn = false;
   SSR_Set(false);
-  Reflow_SetFan(false);
 }
 
 void Reflow_SetSSR(float dutyCycle)
 {
   ctrl.dutyCycle = dutyCycle;
-}
-
-void Reflow_SetFan(bool on)
-{
-  ctrl.fanOn = on;
-  Fan_Set(on);
 }
 
 const ReflowController * Reflow_GetState(void)
