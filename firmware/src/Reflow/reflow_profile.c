@@ -18,11 +18,11 @@ static const ReflowProfile profileLeaded = {
     { .name = "Peak",    .targetTemp = 230.0f, .rampRate =  0.0f, .holdTime = 15 },
     { .name = "Cool",    .targetTemp =  50.0f, .rampRate = -3.0f, .holdTime = 0  },
   },
-  .pidKp = 200.0f,
-  .pidKi = 5.0f,
-  .pidKd = 1000.0f,
+  .pidKp = 3.1f,
+  .pidKi = 0.06f,
+  .pidKd = 42.0f,
   .maxTemp = 260.0f,
-  .stageTimeoutMult = 3.0f,
+  .stageTimeoutMult = 5.0f,
 };
 
 static const ReflowProfile profileLeadFree = {
@@ -37,11 +37,11 @@ static const ReflowProfile profileLeadFree = {
     { .name = "Peak",    .targetTemp = 250.0f, .rampRate =  0.0f, .holdTime = 15 },
     { .name = "Cool",    .targetTemp =  50.0f, .rampRate = -3.0f, .holdTime = 0  },
   },
-  .pidKp = 200.0f,
-  .pidKi = 5.0f,
-  .pidKd = 1000.0f,
+  .pidKp = 3.1f,
+  .pidKi = 0.06f,
+  .pidKd = 42.0f,
   .maxTemp = 280.0f,
-  .stageTimeoutMult = 3.0f,
+  .stageTimeoutMult = 5.0f,
 };
 
 const ReflowProfile * Profile_GetLeaded(void)

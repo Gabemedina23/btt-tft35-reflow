@@ -11,7 +11,7 @@ void Autotune_Init(AutotuneContext *ctx, float targetTemp)
   ctx->dutyCycleHigh = 100.0f;   // Full power when ON
   ctx->dutyCycleLow = 0.0f;      // Off when OFF
   ctx->cycleCount = 0;
-  ctx->minCycles = 4;            // Need at least 4 oscillations
+  ctx->minCycles = 3;            // Need at least 3 oscillations (oven cools slowly without fan)
   ctx->peakCount = 0;
   ctx->valleyCount = 0;
   ctx->lastAboveTarget = false;
@@ -23,7 +23,7 @@ void Autotune_Init(AutotuneContext *ctx, float targetTemp)
   ctx->resultKi = 0.0f;
   ctx->resultKd = 0.0f;
   ctx->startTime = 0;
-  ctx->maxDuration = 600000;     // 10 minutes max
+  ctx->maxDuration = 1800000;    // 30 minutes max (oven needs ~4min per cycle, no fan)
 }
 
 void Autotune_Start(AutotuneContext *ctx)

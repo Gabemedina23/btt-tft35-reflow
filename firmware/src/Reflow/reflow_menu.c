@@ -445,8 +445,19 @@ void menuReflowActive(void)
       // Status bar
       drawStatusBar(state);
 
-      // WS2812 LED color based on state
-      // (Uses existing BTT LED infrastructure)
+      // Flashing "OPEN DOOR" during cooldown
+      if (state->state == REFLOW_COOL)
+      {
+        static bool flashToggle = false;
+        flashToggle = !flashToggle;
+        if (flashToggle)
+        {
+          GUI_SetColor(CYAN);
+          _GUI_DispStringInRect(GRAPH_X, GRAPH_Y + 10,
+                                GRAPH_X2, GRAPH_Y + 10 + BYTE_HEIGHT * 2,
+                                (uint8_t *)">>> OPEN DOOR <<<");
+        }
+      }
     }
 
     // Check if reflow finished or errored
@@ -735,7 +746,7 @@ void menuReflowBurnIn(void)
   PID_Controller burnPid;
   bool needsRedraw = true;
 
-  PID_Init(&burnPid, 200.0f, 5.0f, 1000.0f, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
+  PID_Init(&burnPid, 3.1f, 0.06f, 42.0f, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
 
   ReflowLog_Start("burnin");
   char logMsg[48];
@@ -1011,50 +1022,124 @@ void menuReflowMonitor(void)
 
 void menuReflowSettings(void)
 {
-  const GUI_RECT fullRect = {0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1};
+  // Two touch zones: top half = info (touch to exit), bottom = SSR test button
+  const GUI_RECT exitRect = {0, 0, LCD_WIDTH - 1, LCD_HEIGHT / 2};
+  const GUI_RECT ssrRect = {10, LCD_HEIGHT - BYTE_HEIGHT * 3 - 10,
+                            LCD_WIDTH - 10, LCD_HEIGHT - 10};
+  bool ssrTestActive = false;
+  uint32_t ssrTestEnd = 0;
+  bool needsRedraw = true;
 
   GUI_Clear(infoSettings.bg_color);
-  setMenu(MENU_TYPE_OTHER, NULL, 1, &fullRect, NULL, NULL);
-
-  GUI_SetColor(COLOR_TEXT);
-  _GUI_DispString(5, 5, (uint8_t *)"Reflow Settings");
-  GUI_HLine(0, 25, LCD_WIDTH);
-
-  uint16_t y = 40;
-  GUI_SetColor(YELLOW);
-  _GUI_DispString(5, y, (uint8_t *)"Settings editor coming soon.");
-  y += BYTE_HEIGHT + 4;
-  _GUI_DispString(5, y, (uint8_t *)"Current config:");
-
-  y += BYTE_HEIGHT + 8;
-  GUI_SetColor(COLOR_TEXT);
-
-  char str[48];
-  sprintf(str, "SSR Pin: PC12 (PS-ON)  Active: %s",
-          SSR_ACTIVE_LOW ? "LOW" : "HIGH");
-  _GUI_DispString(10, y, (uint8_t *)str);
-
-  y += BYTE_HEIGHT + 4;
-  _GUI_DispString(10, y, (uint8_t *)"TC1 Board:   PB10/PB11/PA15 (UART3+FIL)");
-
-  y += BYTE_HEIGHT + 4;
-  _GUI_DispString(10, y, (uint8_t *)"TC2 Ambient: PB10/PB11/PA0  (UART3+UART4)");
-
-  y += BYTE_HEIGHT + 4;
-  sprintf(str, "Safety Max: %.0fC  Runaway: +%.0fC",
-          (double)SAFETY_MAX_TEMP_DEFAULT, (double)SAFETY_THERMAL_RUNAWAY_C);
-  _GUI_DispString(10, y, (uint8_t *)str);
-
-  GUI_SetColor(COLOR_TEXT);
-  GUI_HLine(0, LCD_HEIGHT - (BYTE_HEIGHT * 2), LCD_WIDTH);
-  _GUI_DispStringInRect(0, LCD_HEIGHT - (BYTE_HEIGHT * 2), LCD_WIDTH, LCD_HEIGHT,
-                        (uint8_t *)"Touch to go back");
+  setMenu(MENU_TYPE_FULLSCREEN, NULL, 1, &exitRect, NULL, NULL);
 
   while (MENU_IS(menuReflowSettings))
   {
-    if (KEY_GetValue(1, &fullRect) == 0)
+    MAX6675_Update();
+    uint32_t now = OS_GetTimeMs();
+
+    // SSR test timeout (3 seconds)
+    if (ssrTestActive && now >= ssrTestEnd)
+    {
+      ssrTestActive = false;
+      GPIO_SetLevel(SSR_PIN, SSR_ACTIVE_LOW ? 1 : 0);  // SSR off
+      needsRedraw = true;
+    }
+
+    // SSR test — keep SSR on while active
+    if (ssrTestActive)
+    {
+      GPIO_SetLevel(SSR_PIN, SSR_ACTIVE_LOW ? 0 : 1);  // SSR on
+    }
+
+    // Check for touch
+    if (KEY_GetValue(1, &ssrRect) == 0 && !ssrTestActive)
+    {
+      // SSR test button pressed
+      ssrTestActive = true;
+      ssrTestEnd = now + 3000;  // 3 seconds
+      Buzzer_Play(SOUND_OK);
+      needsRedraw = true;
+    }
+    else if (KEY_GetValue(1, &exitRect) == 0 && !ssrTestActive)
+    {
+      GPIO_SetLevel(SSR_PIN, SSR_ACTIVE_LOW ? 1 : 0);
       CLOSE_MENU();
+      break;
+    }
+
+    if (nextScreenUpdate(500) || needsRedraw)
+    {
+      needsRedraw = false;
+      char str[48];
+
+      GUI_SetColor(infoSettings.bg_color);
+      GUI_FillRect(0, 0, LCD_WIDTH, LCD_HEIGHT);
+
+      GUI_SetColor(COLOR_TEXT);
+      _GUI_DispString(5, 5, (uint8_t *)"Settings & Diagnostics");
+      GUI_HLine(0, 28, LCD_WIDTH);
+
+      uint16_t y = 35;
+
+      // PID values
+      GUI_SetColor(YELLOW);
+      _GUI_DispString(10, y, (uint8_t *)"PID (auto-tuned):");
+      y += BYTE_HEIGHT + 2;
+      GUI_SetColor(COLOR_TEXT);
+      sprintf(str, "  Kp=%.1f  Ki=%.2f  Kd=%.1f",
+              (double)Profile_GetLeaded()->pidKp,
+              (double)Profile_GetLeaded()->pidKi,
+              (double)Profile_GetLeaded()->pidKd);
+      _GUI_DispString(10, y, (uint8_t *)str);
+
+      // Pin config
+      y += BYTE_HEIGHT + 8;
+      GUI_SetColor(YELLOW);
+      _GUI_DispString(10, y, (uint8_t *)"Pin Config:");
+      y += BYTE_HEIGHT + 2;
+      GUI_SetColor(COLOR_TEXT);
+      sprintf(str, "  SSR: PC12 (PS-ON)  Active: %s", SSR_ACTIVE_LOW ? "LOW" : "HIGH");
+      _GUI_DispString(10, y, (uint8_t *)str);
+      y += BYTE_HEIGHT + 2;
+      _GUI_DispString(10, y, (uint8_t *)"  TC1 Board:   PA15 CS  (FIL-DET)");
+      y += BYTE_HEIGHT + 2;
+      _GUI_DispString(10, y, (uint8_t *)"  TC2 Ambient: PC11 CS  (UART4 RX)");
+
+      // Live temps
+      y += BYTE_HEIGHT + 8;
+      GUI_SetColor(GREEN);
+      float bt = MAX6675_GetFilteredTemp(TC_BOARD);
+      float at = MAX6675_GetFilteredTemp(TC_AMBIENT);
+      sprintf(str, "Board: %.1fC   Ambient: %.1fC", (double)bt, (double)at);
+      _GUI_DispString(10, y, (uint8_t *)str);
+
+      // SSR Test button
+      if (ssrTestActive)
+      {
+        GUI_SetColor(RED);
+        GUI_FillRect(ssrRect.x0, ssrRect.y0, ssrRect.x1, ssrRect.y1);
+        GUI_SetColor(WHITE);
+        _GUI_DispStringInRect(ssrRect.x0, ssrRect.y0, ssrRect.x1, ssrRect.y1,
+                              (uint8_t *)"SSR ON - TESTING (3s)");
+      }
+      else
+      {
+        GUI_SetColor(GREEN);
+        GUI_DrawRect(ssrRect.x0, ssrRect.y0, ssrRect.x1, ssrRect.y1);
+        GUI_SetColor(COLOR_TEXT);
+        _GUI_DispStringInRect(ssrRect.x0, ssrRect.y0, ssrRect.x1, ssrRect.y1,
+                              (uint8_t *)"Touch here to TEST SSR (3 sec)");
+      }
+
+      // Exit hint
+      GUI_SetColor(COLOR_TEXT);
+      _GUI_DispString(5, ssrRect.y0 - BYTE_HEIGHT - 5, (uint8_t *)"Touch top half to exit");
+    }
 
     loopProcess();
   }
+
+  // Safety: ensure SSR off
+  GPIO_SetLevel(SSR_PIN, SSR_ACTIVE_LOW ? 1 : 0);
 }

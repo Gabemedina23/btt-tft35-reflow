@@ -288,6 +288,16 @@ void Reflow_Update(void)
       ctrl.dutyCycle = 0.0f;
       SSR_Set(false);
 
+      // Beep every 30 seconds to remind user to open the door
+      {
+        static uint32_t lastBeepTime = 0;
+        if ((now - lastBeepTime) >= 30000)
+        {
+          Buzzer_Play(SOUND_NOTIFY);
+          lastBeepTime = now;
+        }
+      }
+
       const ReflowStage *stage = &ctrl.profile.stages[ctrl.currentStage];
 
       if (ctrl.currentTemp <= stage->targetTemp)
