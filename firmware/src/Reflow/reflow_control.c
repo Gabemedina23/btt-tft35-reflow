@@ -97,7 +97,7 @@ static bool CheckSafety(void)
   {
     uint32_t stageElapsed = (OS_GetTimeMs() - ctrl.stageStartTime) / 1000;
     uint16_t expectedDuration = Profile_GetStageDuration(
-      &ctrl.profile.stages[ctrl.currentStage], ctrl.currentTemp);
+      &ctrl.profile.stages[ctrl.currentStage], ctrl.stageStartTemp);
 
     if (expectedDuration > 0)
     {
@@ -125,6 +125,7 @@ static void EnterStage(uint8_t stageIndex)
 {
   ctrl.currentStage = stageIndex;
   ctrl.stageStartTime = OS_GetTimeMs();
+  ctrl.stageStartTemp = ctrl.currentTemp;  // Record temp at stage start for timeout calc
   ctrl.targetTemp = ctrl.profile.stages[stageIndex].targetTemp;
 
   PID_Reset(&ctrl.pid);

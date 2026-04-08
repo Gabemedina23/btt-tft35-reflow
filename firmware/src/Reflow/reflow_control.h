@@ -54,6 +54,7 @@ typedef struct {
   float           targetTemp;     // Current target for display
   float           dutyCycle;      // SSR duty cycle (0-100%)
   uint32_t        stageStartTime; // Tick when current stage began (ms)
+  float           stageStartTemp; // Board temp when current stage began
   uint32_t        profileStartTime; // Tick when profile started (ms)
   uint32_t        lastPidTime;    // Tick of last PID computation
   TempHistory     history;        // Temperature log for graphing (board TC)
