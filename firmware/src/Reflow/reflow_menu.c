@@ -394,20 +394,30 @@ void menuReflowActive(void)
     // Check for abort (encoder click or touch)
     if (LCD_Enc_ReadBtn(200))
     {
-      Reflow_Abort();
+      // Encoder click = abort only during active heating, not during cooldown
+      if (state->state != REFLOW_COOL && state->state < REFLOW_COMPLETE)
+        Reflow_Abort();
     }
 
     if (KEY_GetValue(1, &fullRect) == 0)
     {
-      // Touch detected — abort if running, exit if done
       if (state->state >= REFLOW_COMPLETE)
       {
+        // Done/error/aborted — touch to exit
         Reflow_Reset();
         CLOSE_MENU();
         break;
       }
+      else if (state->state == REFLOW_COOL)
+      {
+        // During cooldown — touch dismisses beeping, doesn't abort
+        // The reflow is effectively done, just waiting to cool
+        Buzzer_Play(SOUND_OK);  // Acknowledge touch
+        // Don't abort — let it keep tracking temperature
+      }
       else if (state->state != REFLOW_IDLE)
       {
+        // During active heating — touch = abort (emergency stop)
         Reflow_Abort();
       }
     }
@@ -453,9 +463,13 @@ void menuReflowActive(void)
         if (flashToggle)
         {
           GUI_SetColor(CYAN);
-          _GUI_DispStringInRect(GRAPH_X, GRAPH_Y + 10,
-                                GRAPH_X2, GRAPH_Y + 10 + BYTE_HEIGHT * 2,
+          _GUI_DispStringInRect(GRAPH_X, GRAPH_Y + 5,
+                                GRAPH_X2, GRAPH_Y + 5 + BYTE_HEIGHT,
                                 (uint8_t *)">>> OPEN DOOR <<<");
+          GUI_SetColor(COLOR_TEXT);
+          _GUI_DispStringInRect(GRAPH_X, GRAPH_Y + 5 + BYTE_HEIGHT + 2,
+                                GRAPH_X2, GRAPH_Y + 5 + BYTE_HEIGHT * 2 + 2,
+                                (uint8_t *)"Reflow done! Cooling to 50C...");
         }
       }
     }
