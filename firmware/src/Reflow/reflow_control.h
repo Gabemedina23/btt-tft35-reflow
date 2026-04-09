@@ -13,11 +13,12 @@ extern "C" {
 // Reflow oven operating states
 typedef enum {
   REFLOW_IDLE = 0,        // Oven off, waiting for user
+  REFLOW_WARMUP,          // SSR on, waiting for board temp to start rising (+5C)
   REFLOW_PREHEAT,         // Ramping to preheat temperature
   REFLOW_SOAK,            // Soaking at temperature
   REFLOW_RAMP,            // Ramping to reflow peak
   REFLOW_PEAK,            // Holding at peak temperature
-  REFLOW_COOL,            // Cooling down (fan on, heater off)
+  REFLOW_COOL,            // Cooling down (heater off, open door)
   REFLOW_COMPLETE,        // Profile finished successfully
   REFLOW_ERROR,           // Error state (thermal runaway, timeout, sensor fault)
   REFLOW_ABORTED,         // User cancelled
@@ -30,7 +31,9 @@ typedef enum {
   REFLOW_ERR_SENSOR_RANGE,      // Temperature reading out of range
   REFLOW_ERR_THERMAL_RUNAWAY,   // Temperature exceeded safe limit
   REFLOW_ERR_STAGE_TIMEOUT,     // Stage took too long
-  REFLOW_ERR_HEATER_FAULT,      // Heater not responding (no temp rise)
+  REFLOW_ERR_HEATER_FAULT,      // Heater not responding (no temp rise after 60s)
+  REFLOW_ERR_TOO_HOT_TO_START,  // Oven too hot to begin a new run
+  REFLOW_ERR_MAX_RUNTIME,       // Absolute max runtime exceeded
 } ReflowError;
 
 // Temperature history for graphing
@@ -55,6 +58,7 @@ typedef struct {
   float           dutyCycle;      // SSR duty cycle (0-100%)
   uint32_t        stageStartTime; // Tick when current stage began (ms)
   float           stageStartTemp; // Board temp when current stage began
+  float           warmupStartTemp; // Board temp when warmup began (for heater fault detection)
   uint32_t        profileStartTime; // Tick when profile started (ms)
   uint32_t        lastPidTime;    // Tick of last PID computation
   TempHistory     history;        // Temperature log for graphing (board TC)

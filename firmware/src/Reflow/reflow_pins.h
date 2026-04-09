@@ -55,9 +55,16 @@
 #define PID_OUTPUT_MAX         100.0f // Maximum duty cycle (100%)
 #define PID_SSR_PERIOD_MS      1000   // SSR PWM period (1 second = 1 Hz on/off cycling)
 
+// --- Warmup config ---
+#define WARMUP_RISE_THRESHOLD     5.0f    // Board must rise this many C before profile starts
+#define WARMUP_TIMEOUT_MS         90000   // Max 90s for coils to warm up (heater fault if exceeded)
+#define WARMUP_HEATER_CHECK_MS    60000   // If no temp rise after 60s at full power = heater fault
+
 // --- Safety limits ---
 #define SAFETY_MAX_TEMP_DEFAULT   280.0f  // Absolute max before emergency shutdown
 #define SAFETY_THERMAL_RUNAWAY_C  20.0f   // Degrees above target = thermal runaway
-#define SAFETY_STAGE_TIMEOUT_MULT 3.0f    // Stage timeout = expected_time * multiplier
+#define SAFETY_STAGE_TIMEOUT_MULT 5.0f    // Stage timeout = expected_time * multiplier
+#define SAFETY_MAX_START_TEMP     50.0f   // Can't start reflow if board temp > this (still hot)
+#define SAFETY_MAX_RUNTIME_MS     900000  // 15 minute absolute max runtime for any reflow
 
 #endif // _REFLOW_PINS_H_

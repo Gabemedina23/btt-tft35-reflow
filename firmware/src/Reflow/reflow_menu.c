@@ -68,6 +68,7 @@ static uint16_t getStageColor(ReflowState state)
 {
   switch (state)
   {
+    case REFLOW_WARMUP:   return ORANGE;
     case REFLOW_PREHEAT:  return COLOR_PREHEAT;
     case REFLOW_SOAK:     return COLOR_SOAK;
     case REFLOW_RAMP:     return COLOR_RAMP;
@@ -334,8 +335,13 @@ void menuReflowMain(void)
     {
       case KEY_ICON_0:  // Start Reflow
       {
-        // Start with default leaded profile (TODO: remember last selection)
         Reflow_Start(Profile_GetLeaded());
+        if (Reflow_GetStatus() == REFLOW_ERROR)
+        {
+          // Too hot to start — show error inline
+          Buzzer_Play(SOUND_ERROR);
+          // Error will be shown on next menu entry
+        }
         OPEN_MENU(menuReflowActive);
         break;
       }
@@ -394,8 +400,8 @@ void menuReflowActive(void)
     // Check for abort (encoder click or touch)
     if (LCD_Enc_ReadBtn(200))
     {
-      // Encoder click = abort only during active heating, not during cooldown
-      if (state->state != REFLOW_COOL && state->state < REFLOW_COMPLETE)
+      // Encoder click = abort only during active heating stages
+      if (state->state >= REFLOW_WARMUP && state->state <= REFLOW_PEAK)
         Reflow_Abort();
     }
 
@@ -410,14 +416,12 @@ void menuReflowActive(void)
       }
       else if (state->state == REFLOW_COOL)
       {
-        // During cooldown — touch dismisses beeping, doesn't abort
-        // The reflow is effectively done, just waiting to cool
-        Buzzer_Play(SOUND_OK);  // Acknowledge touch
-        // Don't abort — let it keep tracking temperature
+        // During cooldown — touch acknowledges, doesn't abort
+        Buzzer_Play(SOUND_OK);
       }
-      else if (state->state != REFLOW_IDLE)
+      else if (state->state >= REFLOW_WARMUP)
       {
-        // During active heating — touch = abort (emergency stop)
+        // During warmup or active heating — touch = abort
         Reflow_Abort();
       }
     }
@@ -454,6 +458,19 @@ void menuReflowActive(void)
 
       // Status bar
       drawStatusBar(state);
+
+      // Warmup indicator
+      if (state->state == REFLOW_WARMUP)
+      {
+        GUI_SetColor(ORANGE);
+        _GUI_DispStringInRect(GRAPH_X, GRAPH_Y + 5,
+                              GRAPH_X2, GRAPH_Y + 5 + BYTE_HEIGHT,
+                              (uint8_t *)"Warming up coils...");
+        GUI_SetColor(COLOR_TEXT);
+        _GUI_DispStringInRect(GRAPH_X, GRAPH_Y + 5 + BYTE_HEIGHT + 2,
+                              GRAPH_X2, GRAPH_Y + 5 + BYTE_HEIGHT * 2 + 2,
+                              (uint8_t *)"Profile starts when board rises 5C");
+      }
 
       // Flashing "OPEN DOOR" during cooldown
       if (state->state == REFLOW_COOL)

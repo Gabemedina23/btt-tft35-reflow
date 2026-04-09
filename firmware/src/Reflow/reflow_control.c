@@ -232,6 +232,22 @@ void Reflow_Update(void)
                     ctrl.dutyCycle, Reflow_GetStateName(ctrl.state), stageName);
   }
 
+  // Absolute max runtime safety check
+  if (ctrl.state >= REFLOW_WARMUP && ctrl.state <= REFLOW_COOL)
+  {
+    if ((now - ctrl.profileStartTime) > SAFETY_MAX_RUNTIME_MS)
+    {
+      ctrl.error = REFLOW_ERR_MAX_RUNTIME;
+      ctrl.state = REFLOW_ERROR;
+      ctrl.dutyCycle = 0.0f;
+      SSR_Set(false);
+      char logMsg[48];
+      sprintf(logMsg, "ERROR: Max runtime exceeded (%lus)", (unsigned long)(SAFETY_MAX_RUNTIME_MS / 1000));
+      ReflowLog_Event(logMsg);
+      ReflowLog_Stop();
+    }
+  }
+
   // State machine
   switch (ctrl.state)
   {
@@ -245,6 +261,59 @@ void Reflow_Update(void)
       ctrl.dutyCycle = 0.0f;
       SSR_Set(false);
       break;
+
+    case REFLOW_WARMUP:
+    {
+      // Full power, waiting for board temp to rise before starting profile
+      ctrl.dutyCycle = PID_OUTPUT_MAX;
+
+      // Check for heater fault (no temp rise after 60s at full power)
+      uint32_t warmupElapsed = now - ctrl.profileStartTime;
+      if (warmupElapsed > WARMUP_HEATER_CHECK_MS)
+      {
+        if (ctrl.currentTemp < ctrl.warmupStartTemp + 3.0f)
+        {
+          ctrl.error = REFLOW_ERR_HEATER_FAULT;
+          ctrl.state = REFLOW_ERROR;
+          ctrl.dutyCycle = 0.0f;
+          SSR_Set(false);
+          ReflowLog_Event("ERROR: Heater not responding (no temp rise after 60s)");
+          ReflowLog_Stop();
+          break;
+        }
+      }
+
+      // Warmup timeout
+      if (warmupElapsed > WARMUP_TIMEOUT_MS)
+      {
+        ctrl.error = REFLOW_ERR_HEATER_FAULT;
+        ctrl.state = REFLOW_ERROR;
+        ctrl.dutyCycle = 0.0f;
+        SSR_Set(false);
+        ReflowLog_Event("ERROR: Warmup timeout (coils not heating fast enough)");
+        ReflowLog_Stop();
+        break;
+      }
+
+      // Check if board temp has risen enough to start the profile
+      if (ctrl.currentTemp >= ctrl.warmupStartTemp + WARMUP_RISE_THRESHOLD)
+      {
+        // Coils are hot — now start the real profile
+        char logMsg[48];
+        sprintf(logMsg, "Warmup done at %.1fC, starting profile", (double)ctrl.currentTemp);
+        ReflowLog_Event(logMsg);
+
+        // Reset profile start time so elapsed time counts from now
+        ctrl.profileStartTime = now;
+        ctrl.state = REFLOW_PREHEAT;
+        EnterStage(0);
+      }
+
+      // Record temperatures during warmup too
+      RecordTemperature(&ctrl.history, ctrl.currentTemp);
+      RecordTemperature(&ctrl.ambientHistory, ctrl.ambientTemp);
+      break;
+    }
 
     case REFLOW_PREHEAT:
     case REFLOW_RAMP:
@@ -332,17 +401,33 @@ void Reflow_Update(void)
 
 void Reflow_Start(const ReflowProfile *profile)
 {
+  // Safety: don't start if oven is still hot from a previous run
+  MAX6675_Update();
+  float startTemp = MAX6675_GetFilteredTemp(TC_BOARD);
+  if (startTemp > SAFETY_MAX_START_TEMP)
+  {
+    ctrl.error = REFLOW_ERR_TOO_HOT_TO_START;
+    ctrl.state = REFLOW_ERROR;
+    ctrl.currentTemp = startTemp;
+    return;
+  }
+
   memcpy(&ctrl.profile, profile, sizeof(ReflowProfile));
 
-  ctrl.state = REFLOW_PREHEAT;
+  // Start in WARMUP — full power, wait for board temp to rise before starting profile timer
+  ctrl.state = REFLOW_WARMUP;
   ctrl.error = REFLOW_ERR_NONE;
   ctrl.profileStartTime = OS_GetTimeMs();
   ctrl.lastPidTime = OS_GetTimeMs();
-  ctrl.dutyCycle = PID_OUTPUT_MAX;  // Start at full power immediately
+  ctrl.dutyCycle = PID_OUTPUT_MAX;  // Full power immediately
+  ctrl.warmupStartTemp = startTemp;
 
   // Start SD card logging
   ReflowLog_Start("reflow");
   ReflowLog_Event(ctrl.profile.name);
+  char logMsg[48];
+  sprintf(logMsg, "Warmup started at %.1fC", (double)startTemp);
+  ReflowLog_Event(logMsg);
 
   // Clear history for both sensors
   ctrl.history.head = 0;
@@ -412,6 +497,7 @@ const char * Reflow_GetStateName(ReflowState state)
   switch (state)
   {
     case REFLOW_IDLE:     return "Idle";
+    case REFLOW_WARMUP:   return "Warming Up";
     case REFLOW_PREHEAT:  return "Preheat";
     case REFLOW_SOAK:     return "Soak";
     case REFLOW_RAMP:     return "Ramp";
@@ -434,6 +520,8 @@ const char * Reflow_GetErrorName(ReflowError error)
     case REFLOW_ERR_THERMAL_RUNAWAY:  return "Thermal runaway!";
     case REFLOW_ERR_STAGE_TIMEOUT:    return "Stage timeout";
     case REFLOW_ERR_HEATER_FAULT:     return "Heater not responding";
+    case REFLOW_ERR_TOO_HOT_TO_START: return "Oven too hot to start";
+    case REFLOW_ERR_MAX_RUNTIME:      return "Max runtime exceeded";
     default:                          return "Unknown error";
   }
 }
