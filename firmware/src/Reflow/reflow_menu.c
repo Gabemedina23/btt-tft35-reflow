@@ -1121,6 +1121,9 @@ void menuReflowCalibrate(void)
   // Door state tracking for cooling
   bool doorOpenPrompted = false;
 
+  // Overshoot tracking during heating/stable
+  bool overshootDoorOpen = false;  // true when we've told user to open door during overshoot
+
   bool needsRedraw = true;
 
   GUI_Clear(infoSettings.bg_color);
@@ -1144,23 +1147,55 @@ void menuReflowCalibrate(void)
         float target = calTargets[calStep];
         float diff = target - rawTemp;
 
-        // Graduated approach to prevent overshoot:
-        // >30°C away: 100% duty (full blast)
-        // 20-30°C away: 75% duty
-        // 10-20°C away: 50% duty (let thermal inertia carry us)
-        // <10°C away: PID takes over for fine control
-        if (diff > 30.0f)
-          calDuty = PID_OUTPUT_MAX;
-        else if (diff > 20.0f)
-          calDuty = 75.0f;
-        else if (diff > 10.0f)
-          calDuty = 50.0f;
+        // Scale max duty by target temperature — low targets need gentle heat
+        // because the oven has ~45s of thermal lag and will coast way past
+        float maxDuty;
+        float cutoffDist;  // distance at which to cut to 0% and coast
+        if (target <= 75.0f)
+        {
+          maxDuty = 25.0f;     // 25% max for low targets
+          cutoffDist = 15.0f;  // cut power 15°C early, let residual heat carry in
+        }
+        else if (target <= 125.0f)
+        {
+          maxDuty = 50.0f;
+          cutoffDist = 12.0f;
+        }
         else
+        {
+          maxDuty = PID_OUTPUT_MAX;
+          cutoffDist = 10.0f;
+        }
+
+        // Graduated approach with target-scaled power:
+        // > cutoffDist away: maxDuty
+        // within cutoffDist: PID for fine control (or 0 if above target)
+        if (diff > cutoffDist)
+          calDuty = maxDuty;
+        else if (diff > 0)
           calDuty = PID_Compute(&calPid, rawTemp, target, dt);
+        else
+          calDuty = 0;  // above target — heater fully off, coast/cool
 
         // Track temperature swings
         if (rawTemp > heatingPeakTemp) heatingPeakTemp = rawTemp;
         if (rawTemp < heatingMinTemp)  heatingMinTemp = rawTemp;
+
+        // Overshoot door management during heating/stable
+        if (rawTemp > target + 20.0f && !overshootDoorOpen)
+        {
+          overshootDoorOpen = true;
+          Buzzer_Play(SOUND_NOTIFY);
+          ReflowLog_Event("Overshoot >20C above target, prompting door open");
+          needsRedraw = true;
+        }
+        else if (rawTemp <= target + 10.0f && overshootDoorOpen)
+        {
+          overshootDoorOpen = false;
+          Buzzer_Play(SOUND_NOTIFY);
+          ReflowLog_Event("Temp within 10C of target, prompting door close");
+          needsRedraw = true;
+        }
       }
 
       // Log data every 2 seconds during heating/stable
@@ -1412,6 +1447,7 @@ void menuReflowCalibrate(void)
               PID_Reset(&calPid);
               heatingPeakTemp = rawTemp;
               heatingMinTemp = rawTemp;
+              overshootDoorOpen = false;
             }
           }
           needsRedraw = true;
@@ -1450,6 +1486,7 @@ void menuReflowCalibrate(void)
           PID_Reset(&calPid);
           heatingPeakTemp = rawTemp;
           heatingMinTemp = rawTemp;
+          overshootDoorOpen = false;
           Buzzer_Play(SOUND_NOTIFY);
           needsRedraw = true;
           char logMsg[64];
@@ -1553,19 +1590,30 @@ void menuReflowCalibrate(void)
         _GUI_DispString(10, y, (uint8_t *)str);
 
         y += BYTE_HEIGHT + 8;
-        if (calState == CAL_STABLE)
+        if (overshootDoorOpen)
+        {
+          // Overshoot — tell user to open door
+          GUI_SetColor(RED);
+          _GUI_DispString(10, y, (uint8_t *)">>> OPEN THE OVEN DOOR <<<");
+          y += BYTE_HEIGHT + 4;
+          GUI_SetColor(YELLOW);
+          sprintf(str, "Overshot! Waiting to cool to %.0f C...", (double)(target + 10.0f));
+          _GUI_DispString(10, y, (uint8_t *)str);
+        }
+        else if (calState == CAL_STABLE)
         {
           uint32_t waitLeft = 15 - (now - stableStartTime) / 1000;
           if (waitLeft > 15) waitLeft = 15;
           GUI_SetColor(CYAN);
           sprintf(str, "Stabilizing... %lus remaining", (unsigned long)waitLeft);
+          _GUI_DispString(10, y, (uint8_t *)str);
         }
         else
         {
           GUI_SetColor(ORANGE);
           sprintf(str, "Heating...");
+          _GUI_DispString(10, y, (uint8_t *)str);
         }
-        _GUI_DispString(10, y, (uint8_t *)str);
 
         // Progress bar
         y += BYTE_HEIGHT + 8;
@@ -1573,7 +1621,7 @@ void menuReflowCalibrate(void)
         if (barW > 400) barW = 400;
         GUI_SetColor(0x2104);
         GUI_FillRect(40, y, 440, y + 12);
-        GUI_SetColor(GREEN);
+        GUI_SetColor(rawTemp > target ? RED : GREEN);
         GUI_FillRect(40, y, 40 + barW, y + 12);
 
         // Abort hint
