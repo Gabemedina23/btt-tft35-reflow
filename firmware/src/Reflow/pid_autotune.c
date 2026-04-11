@@ -36,6 +36,8 @@ void Autotune_Start(AutotuneContext *ctx)
   ctx->currentPeak = 0.0f;
   ctx->currentValley = 9999.0f;
   ctx->startTime = OS_GetTimeMs();
+  ctx->rampStartTemp = -999.0f;  // will be set on first update
+  ctx->rampPhase1Done = false;
 }
 
 float Autotune_Update(AutotuneContext *ctx, float currentTemp)
@@ -56,16 +58,40 @@ float Autotune_Update(AutotuneContext *ctx, float currentTemp)
   switch (ctx->state)
   {
     case AUTOTUNE_HEATING:
-      // Initial ramp — full power until we first reach target
-      output = ctx->dutyCycleHigh;
-      if (currentTemp >= ctx->targetTemp)
+    {
+      // Three-phase ramp to target to avoid massive thermal overshoot:
+      // Phase 1: 25% until board temp rises 2°C (element warmup)
+      // Phase 2: 50% cruise until within 10°C of target
+      // Phase 3: 10% gentle approach for last 10°C
+      if (ctx->rampStartTemp < -900.0f)
+        ctx->rampStartTemp = currentTemp;  // capture starting temp on first call
+
+      float diff = ctx->targetTemp - currentTemp;
+
+      if (diff <= 0)
       {
+        // Reached target — transition to relay oscillation
         ctx->state = AUTOTUNE_RELAY_OFF;
         ctx->lastAboveTarget = true;
         ctx->currentPeak = currentTemp;
         ctx->currentValley = 9999.0f;
       }
+      else if (!ctx->rampPhase1Done)
+      {
+        output = 25.0f;
+        if (currentTemp >= ctx->rampStartTemp + 2.0f)
+          ctx->rampPhase1Done = true;
+      }
+      else if (diff > 10.0f)
+      {
+        output = 50.0f;  // cruise
+      }
+      else
+      {
+        output = 10.0f;  // gentle approach
+      }
       break;
+    }
 
     case AUTOTUNE_RELAY_ON:
       // Heater ON — waiting for temp to rise above target + hysteresis

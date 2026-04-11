@@ -1118,6 +1118,13 @@ void menuReflowCalibrate(void)
   float heatingMinTemp = 999.0f;
   uint32_t lastLogTime = 0;
 
+  // Ramp-up phase tracking:
+  // Phase 1: 25% duty until board temp rises 2°C (element warmup)
+  // Phase 2: 50% duty until within 10°C of target (cruise)
+  // Phase 3: 10% duty until target (gentle approach)
+  float rampStartTemp = 0;       // temp when heating began for this step
+  bool  rampPhase1Done = false;  // true once we've seen 2°C rise
+
   // Door state tracking for cooling
   bool doorOpenPrompted = false;
 
@@ -1147,35 +1154,28 @@ void menuReflowCalibrate(void)
         float target = calTargets[calStep];
         float diff = target - rawTemp;
 
-        // Scale max duty by target temperature — low targets need gentle heat
-        // because the oven has ~45s of thermal lag and will coast way past
-        float maxDuty;
-        float cutoffDist;  // distance at which to cut to 0% and coast
-        if (target <= 75.0f)
+        // Three-phase ramp-up to handle massive thermal inertia of steel tray:
+        // Phase 1: 25% duty until board temp rises 2°C → proves element is warming tray
+        // Phase 2: 50% duty until within 10°C of target → main cruise heating
+        // Phase 3: 10% duty until target → gentle approach, let stored heat coast in
+        if (diff <= 0)
         {
-          maxDuty = 25.0f;     // 25% max for low targets
-          cutoffDist = 15.0f;  // cut power 15°C early, let residual heat carry in
+          calDuty = 0;  // above target — heater fully off
         }
-        else if (target <= 125.0f)
+        else if (!rampPhase1Done)
         {
-          maxDuty = 50.0f;
-          cutoffDist = 12.0f;
+          calDuty = 25.0f;
+          if (rawTemp >= rampStartTemp + 2.0f)
+            rampPhase1Done = true;
+        }
+        else if (diff > 10.0f)
+        {
+          calDuty = 50.0f;  // cruise phase
         }
         else
         {
-          maxDuty = PID_OUTPUT_MAX;
-          cutoffDist = 10.0f;
+          calDuty = 10.0f;  // gentle approach for last 10°C
         }
-
-        // Graduated approach with target-scaled power:
-        // > cutoffDist away: maxDuty
-        // within cutoffDist: PID for fine control (or 0 if above target)
-        if (diff > cutoffDist)
-          calDuty = maxDuty;
-        else if (diff > 0)
-          calDuty = PID_Compute(&calPid, rawTemp, target, dt);
-        else
-          calDuty = 0;  // above target — heater fully off, coast/cool
 
         // Track temperature swings
         if (rawTemp > heatingPeakTemp) heatingPeakTemp = rawTemp;
@@ -1275,6 +1275,8 @@ void menuReflowCalibrate(void)
             PID_Reset(&calPid);
             heatingPeakTemp = rawTemp;
             heatingMinTemp = rawTemp;
+            rampStartTemp = rawTemp;
+            rampPhase1Done = false;
           }
           needsRedraw = true;
           Buzzer_Play(SOUND_OK);
@@ -1447,6 +1449,8 @@ void menuReflowCalibrate(void)
               PID_Reset(&calPid);
               heatingPeakTemp = rawTemp;
               heatingMinTemp = rawTemp;
+              rampStartTemp = rawTemp;
+              rampPhase1Done = false;
               overshootDoorOpen = false;
             }
           }
@@ -1486,6 +1490,8 @@ void menuReflowCalibrate(void)
           PID_Reset(&calPid);
           heatingPeakTemp = rawTemp;
           heatingMinTemp = rawTemp;
+          rampStartTemp = rawTemp;
+          rampPhase1Done = false;
           overshootDoorOpen = false;
           Buzzer_Play(SOUND_NOTIFY);
           needsRedraw = true;
@@ -1611,7 +1617,13 @@ void menuReflowCalibrate(void)
         else
         {
           GUI_SetColor(ORANGE);
-          sprintf(str, "Heating...");
+          if (!rampPhase1Done)
+            sprintf(str, "Warming up (25%%)... +%.1fC",
+                    (double)(rawTemp - rampStartTemp));
+          else if (target - rawTemp > 10.0f)
+            sprintf(str, "Heating (50%%)...");
+          else
+            sprintf(str, "Approaching (10%%)...");
           _GUI_DispString(10, y, (uint8_t *)str);
         }
 
