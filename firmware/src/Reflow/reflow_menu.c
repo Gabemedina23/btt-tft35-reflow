@@ -39,6 +39,20 @@
 #define GRAPH_REFRESH_MS  1000
 
 // =============================================================================
+// Selected profile (persists across menu navigation)
+// =============================================================================
+
+static const ReflowProfile *selectedProfile = NULL;
+
+static const ReflowProfile * getSelectedProfile(void)
+{
+  if (selectedProfile == NULL)
+    selectedProfile = Profile_GetLeaded();  // default
+  return selectedProfile;
+}
+
+
+// =============================================================================
 // Helper: map temperature/time to pixel coordinates
 // =============================================================================
 
@@ -307,18 +321,22 @@ static void drawHeader(const char *profileName, const ReflowController *state)
 
 void menuReflowMain(void)
 {
+  // Build start button label with selected profile name
+  static char startLabel[32];
+  sprintf(startLabel, "Start: %s", getSelectedProfile()->name);
+
   MENUITEMS reflowItems = {
     // title
     LABEL_CUSTOM,  // reuse existing label slot for title
     // icon                          label
     {
-      {ICON_HEAT_FAN,                {.address = (void *)"Start"}},
+      {ICON_HEAT_FAN,                {.address = (void *)startLabel}},
       {ICON_CUSTOM,                  {.address = (void *)"Profiles"}},
       {ICON_FEATURE_SETTINGS,        {.address = (void *)"Auto Tune"}},
       {ICON_SCREEN_INFO,             {.address = (void *)"Monitor"}},
       {ICON_SETTINGS,                {.address = (void *)"Settings"}},
       {ICON_HEAT_FAN,                {.address = (void *)"Burn-In"}},
-      {ICON_NULL,                    {.index = LABEL_NULL}},
+      {ICON_FEATURE_SETTINGS,        {.address = (void *)"Calibrate"}},
       {ICON_NULL,                    {.index = LABEL_NULL}},
     }
   };
@@ -333,9 +351,9 @@ void menuReflowMain(void)
 
     switch (key_num)
     {
-      case KEY_ICON_0:  // Start Reflow
+      case KEY_ICON_0:  // Start Reflow (uses selected profile)
       {
-        Reflow_Start(Profile_GetLeaded());
+        Reflow_Start(getSelectedProfile());
         if (Reflow_GetStatus() == REFLOW_ERROR)
         {
           // Too hot to start — show error inline
@@ -364,6 +382,10 @@ void menuReflowMain(void)
 
       case KEY_ICON_5:  // Burn-In
         OPEN_MENU(menuReflowBurnIn);
+        break;
+
+      case KEY_ICON_6:  // Calibrate
+        OPEN_MENU(menuReflowCalibrate);
         break;
 
       default:
@@ -557,13 +579,15 @@ void menuReflowProfiles(void)
     switch (key_num)
     {
       case KEY_ICON_0:  // Leaded
-        Reflow_Start(Profile_GetLeaded());
-        OPEN_MENU(menuReflowActive);
+        selectedProfile = Profile_GetLeaded();
+        Buzzer_Play(SOUND_OK);
+        CLOSE_MENU();
         break;
 
       case KEY_ICON_1:  // Lead-Free
-        Reflow_Start(Profile_GetLeadFree());
-        OPEN_MENU(menuReflowActive);
+        selectedProfile = Profile_GetLeadFree();
+        Buzzer_Play(SOUND_OK);
+        CLOSE_MENU();
         break;
 
       case KEY_ICON_7:  // Back
@@ -1045,6 +1069,696 @@ void menuReflowMonitor(void)
 
     loopProcess();
   }
+}
+
+// =============================================================================
+// Thermocouple Calibration Menu
+// =============================================================================
+
+// Calibration step targets (sensor °C values the PID will heat to)
+static const float calTargets[TC_CAL_POINTS] = { 0, 50, 100, 150, 175, 200 };
+// Step 0 target=0 means "ambient, no heating"
+
+void menuReflowCalibrate(void)
+{
+  const GUI_RECT fullRect = {0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1};
+
+  // Touch zones for temperature input buttons
+  const GUI_RECT btnMinus10 = {  20, 220, 110, 265 };
+  const GUI_RECT btnMinus1  = { 120, 220, 210, 265 };
+  const GUI_RECT btnPlus1   = { 270, 220, 360, 265 };
+  const GUI_RECT btnPlus10  = { 370, 220, 460, 265 };
+  const GUI_RECT btnConfirm = { 140, 275, 340, 315 };
+  const GUI_RECT btnAbort   = {   0,   0, LCD_WIDTH - 1, 25 };
+
+  char str[64];
+  bool useFahrenheit = true;  // default to °F since user's thermometer reads F
+  int inputValue = 77;        // starting input value (°F for room temp)
+
+  TC_Calibration newCal;
+  newCal.numPoints = 0;
+  newCal.enabled = false;
+
+  // Calibration state machine
+  typedef enum { CAL_INTRO, CAL_HEATING, CAL_STABLE, CAL_INPUT, CAL_COOLING, CAL_DONE, CAL_ABORTED } CalState;
+  CalState calState = CAL_INTRO;
+  uint8_t  calStep = 0;
+
+  // PID for heating
+  PID_Controller calPid;
+  PID_Init(&calPid, 4.1f, 0.03f, 167.2f, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
+  float calDuty = 0;
+  uint32_t lastPidTime = OS_GetTimeMs();
+
+  // Stability detection: temp must stay within 3°C for 15 seconds
+  uint32_t stableStartTime = 0;
+
+  // Swing tracking during heating
+  float heatingPeakTemp = 0;
+  float heatingMinTemp = 999.0f;
+  uint32_t lastLogTime = 0;
+
+  // Door state tracking for cooling
+  bool doorOpenPrompted = false;
+
+  bool needsRedraw = true;
+
+  GUI_Clear(infoSettings.bg_color);
+  setMenu(MENU_TYPE_FULLSCREEN, NULL, 1, &fullRect, NULL, NULL);
+
+  while (MENU_IS(menuReflowCalibrate))
+  {
+    uint32_t now = OS_GetTimeMs();
+
+    // Always update thermocouples
+    MAX6675_Update();
+    float rawTemp = MAX6675_GetRawFilteredTemp(TC_BOARD);
+
+    // ---- SSR control during heating ----
+    if (calState == CAL_HEATING || calState == CAL_STABLE)
+    {
+      if ((now - lastPidTime) >= PID_UPDATE_INTERVAL_MS)
+      {
+        float dt = (float)(now - lastPidTime) / 1000.0f;
+        lastPidTime = now;
+        float target = calTargets[calStep];
+        float diff = target - rawTemp;
+
+        // Graduated approach to prevent overshoot:
+        // >30°C away: 100% duty (full blast)
+        // 20-30°C away: 75% duty
+        // 10-20°C away: 50% duty (let thermal inertia carry us)
+        // <10°C away: PID takes over for fine control
+        if (diff > 30.0f)
+          calDuty = PID_OUTPUT_MAX;
+        else if (diff > 20.0f)
+          calDuty = 75.0f;
+        else if (diff > 10.0f)
+          calDuty = 50.0f;
+        else
+          calDuty = PID_Compute(&calPid, rawTemp, target, dt);
+
+        // Track temperature swings
+        if (rawTemp > heatingPeakTemp) heatingPeakTemp = rawTemp;
+        if (rawTemp < heatingMinTemp)  heatingMinTemp = rawTemp;
+      }
+
+      // Log data every 2 seconds during heating/stable
+      if ((now - lastLogTime) >= 2000)
+      {
+        lastLogTime = now;
+        float ambientTemp = MAX6675_GetFilteredTemp(TC_AMBIENT);
+        float target = calTargets[calStep];
+        const char *stateStr = (calState == CAL_STABLE) ? "Stable" : "Heating";
+        char stageStr[16];
+        sprintf(stageStr, "Step%d", calStep + 1);
+        ReflowLog_Write(rawTemp, ambientTemp, target, calDuty, stateStr, stageStr);
+      }
+
+      // SSR PWM
+      static uint32_t ssrStart = 0;
+      if ((now - ssrStart) >= PID_SSR_PERIOD_MS) ssrStart = now;
+      uint32_t onTime = (uint32_t)(calDuty * PID_SSR_PERIOD_MS / 100.0f);
+      bool ssrOn = ((now - ssrStart) < onTime);
+      GPIO_SetLevel(SSR_PIN, SSR_ACTIVE_LOW ? (ssrOn ? 0 : 1) : (ssrOn ? 1 : 0));
+    }
+    else
+    {
+      // SSR off
+      GPIO_SetLevel(SSR_PIN, SSR_ACTIVE_LOW ? 1 : 0);
+      calDuty = 0;
+
+      // Log during cooling state too
+      if (calState == CAL_COOLING && (now - lastLogTime) >= 2000)
+      {
+        lastLogTime = now;
+        float ambientTemp = MAX6675_GetFilteredTemp(TC_AMBIENT);
+        float target = calTargets[calStep];
+        char stageStr[16];
+        sprintf(stageStr, "Cool%d", calStep + 1);
+        ReflowLog_Write(rawTemp, ambientTemp, target, 0, "Cooling", stageStr);
+      }
+    }
+
+    // ---- Touch handling ----
+    // KEY_GetValue uses static state, so only ONE call per loop iteration.
+    // We pass all zones as an array and switch on the returned index.
+
+    switch (calState)
+    {
+      case CAL_INTRO:
+      {
+        // Zones: 0=toggle C/F, 1=start
+        const GUI_RECT introZones[] = {
+          { 100, 100, 380, 150 },  // toggle
+          { 100, 180, 380, 230 },  // start
+        };
+        uint16_t key = KEY_GetValue(2, introZones);
+
+        if (key == 0)  // Toggle C/F
+        {
+          useFahrenheit = !useFahrenheit;
+          needsRedraw = true;
+        }
+        else if (key == 1)  // Start
+        {
+          calStep = 0;
+          ReflowLog_Start("calibrate");
+          ReflowLog_Event("Calibration started");
+          lastLogTime = now;
+          if (calTargets[0] == 0)
+          {
+            calState = CAL_INPUT;
+            if (useFahrenheit)
+              inputValue = (int)(rawTemp * 9.0f / 5.0f + 32.0f);
+            else
+              inputValue = (int)rawTemp;
+          }
+          else
+          {
+            calState = CAL_HEATING;
+            PID_Reset(&calPid);
+            heatingPeakTemp = rawTemp;
+            heatingMinTemp = rawTemp;
+          }
+          needsRedraw = true;
+          Buzzer_Play(SOUND_OK);
+        }
+        break;
+      }
+
+      case CAL_HEATING:
+      {
+        float target = calTargets[calStep];
+
+        // Zones: 0=abort
+        uint16_t key = KEY_GetValue(1, &btnAbort);
+        if (key == 0 || LCD_Enc_ReadBtn(200))
+        {
+          calState = CAL_ABORTED;
+          GPIO_SetLevel(SSR_PIN, SSR_ACTIVE_LOW ? 1 : 0);
+          ReflowLog_Event("Calibration aborted by user during heating");
+          needsRedraw = true;
+          Buzzer_Play(SOUND_OK);
+          break;
+        }
+
+        if (rawTemp >= target - 3.0f)
+        {
+          calState = CAL_STABLE;
+          stableStartTime = now;
+          needsRedraw = true;
+          char logMsg[64];
+          sprintf(logMsg, "Step%d reached target %.0fC (swing: %.1f-%.1fC)",
+                  calStep + 1, (double)target,
+                  (double)heatingMinTemp, (double)heatingPeakTemp);
+          ReflowLog_Event(logMsg);
+        }
+
+        if (rawTemp > target + SAFETY_THERMAL_RUNAWAY_C)
+        {
+          calState = CAL_ABORTED;
+          GPIO_SetLevel(SSR_PIN, SSR_ACTIVE_LOW ? 1 : 0);
+          ReflowLog_Event("Calibration aborted: thermal runaway");
+          needsRedraw = true;
+        }
+        break;
+      }
+
+      case CAL_STABLE:
+      {
+        float target = calTargets[calStep];
+
+        // Zones: 0=abort
+        uint16_t key = KEY_GetValue(1, &btnAbort);
+        if (key == 0 || LCD_Enc_ReadBtn(200))
+        {
+          calState = CAL_ABORTED;
+          GPIO_SetLevel(SSR_PIN, SSR_ACTIVE_LOW ? 1 : 0);
+          ReflowLog_Event("Calibration aborted by user during stabilize");
+          needsRedraw = true;
+          Buzzer_Play(SOUND_OK);
+          break;
+        }
+
+        if (fabsf(rawTemp - target) > 3.0f)
+          stableStartTime = now;
+
+        if ((now - stableStartTime) >= 15000)
+        {
+          calState = CAL_INPUT;
+          if (useFahrenheit)
+            inputValue = (int)(rawTemp * 9.0f / 5.0f + 32.0f);
+          else
+            inputValue = (int)rawTemp;
+          needsRedraw = true;
+          Buzzer_Play(SOUND_NOTIFY);
+          char logMsg[64];
+          sprintf(logMsg, "Step%d stable at %.1fC, awaiting input",
+                  calStep + 1, (double)rawTemp);
+          ReflowLog_Event(logMsg);
+        }
+        break;
+      }
+
+      case CAL_INPUT:
+      {
+        // Handle encoder rotation (each click = +/- 1 degree)
+        #if LCD_ENCODER_SUPPORT
+        {
+          int16_t encDelta = encoderPosition;
+          if (encDelta != 0)
+          {
+            encoderPosition = 0;
+            inputValue += encDelta;
+            needsRedraw = true;
+          }
+        }
+        #endif
+
+        // Zones: 0=-10, 1=-1, 2=+1, 3=+10, 4=confirm, 5=abort(title bar)
+        const GUI_RECT inputZones[] = {
+          btnMinus10, btnMinus1, btnPlus1, btnPlus10, btnConfirm, btnAbort
+        };
+        uint16_t key = KEY_GetValue(6, inputZones);
+
+        switch (key)
+        {
+          case 0: inputValue -= 10; needsRedraw = true; break;
+          case 1: inputValue -= 1;  needsRedraw = true; break;
+          case 2: inputValue += 1;  needsRedraw = true; break;
+          case 3: inputValue += 10; needsRedraw = true; break;
+          case 4: break;  // confirm handled below
+          case 5:         // abort
+            calState = CAL_ABORTED;
+            GPIO_SetLevel(SSR_PIN, SSR_ACTIVE_LOW ? 1 : 0);
+            needsRedraw = true;
+            Buzzer_Play(SOUND_OK);
+            break;
+          default: break;
+        }
+
+        // Clamp
+        if (inputValue < -40) inputValue = -40;
+        if (useFahrenheit && inputValue > 600) inputValue = 600;
+        if (!useFahrenheit && inputValue > 350) inputValue = 350;
+
+        // Confirm: touch button (key==4) or encoder click
+        if (key == 4 || LCD_Enc_ReadBtn(200))
+        {
+          float actualC;
+          if (useFahrenheit)
+            actualC = ((float)inputValue - 32.0f) * 5.0f / 9.0f;
+          else
+            actualC = (float)inputValue;
+
+          newCal.points[calStep].sensorC = rawTemp;
+          newCal.points[calStep].actualC = actualC;
+          newCal.numPoints = calStep + 1;
+
+          Buzzer_Play(SOUND_OK);
+
+          char logMsg[80];
+          sprintf(logMsg, "Step%d confirmed: sensor=%.1fC actual=%.1fC",
+                  calStep + 1, (double)rawTemp, (double)actualC);
+          ReflowLog_Event(logMsg);
+
+          calStep++;
+          if (calStep >= TC_CAL_POINTS)
+          {
+            newCal.enabled = true;
+            MAX6675_SetCalibration(&newCal);
+            MAX6675_SaveCalibration();
+            calState = CAL_DONE;
+            GPIO_SetLevel(SSR_PIN, SSR_ACTIVE_LOW ? 1 : 0);
+            ReflowLog_Event("Calibration complete, saved to TCAL.DAT");
+            ReflowLog_Stop();
+          }
+          else
+          {
+            float nextTarget = calTargets[calStep];
+            // If we're already above the next target (overshoot), cool first
+            if (rawTemp > nextTarget + 10.0f)
+            {
+              calState = CAL_COOLING;
+              doorOpenPrompted = false;
+              sprintf(logMsg, "Cooling needed: %.1fC > target %.0fC",
+                      (double)rawTemp, (double)nextTarget);
+              ReflowLog_Event(logMsg);
+            }
+            else
+            {
+              calState = CAL_HEATING;
+              PID_Reset(&calPid);
+              heatingPeakTemp = rawTemp;
+              heatingMinTemp = rawTemp;
+            }
+          }
+          needsRedraw = true;
+        }
+        break;
+      }
+
+      case CAL_COOLING:
+      {
+        float nextTarget = calTargets[calStep];
+
+        // Zones: 0=abort
+        uint16_t key = KEY_GetValue(1, &btnAbort);
+        if (key == 0 || LCD_Enc_ReadBtn(200))
+        {
+          calState = CAL_ABORTED;
+          GPIO_SetLevel(SSR_PIN, SSR_ACTIVE_LOW ? 1 : 0);
+          ReflowLog_Event("Calibration aborted by user during cooling");
+          needsRedraw = true;
+          Buzzer_Play(SOUND_OK);
+          break;
+        }
+
+        // Prompt to open door when >20°C above target
+        if (rawTemp > nextTarget + 20.0f && !doorOpenPrompted)
+        {
+          doorOpenPrompted = true;
+          Buzzer_Play(SOUND_NOTIFY);
+          needsRedraw = true;
+        }
+
+        // When within 10°C of target, prompt to close door and transition to heating
+        if (rawTemp <= nextTarget + 10.0f)
+        {
+          calState = CAL_HEATING;
+          PID_Reset(&calPid);
+          heatingPeakTemp = rawTemp;
+          heatingMinTemp = rawTemp;
+          Buzzer_Play(SOUND_NOTIFY);
+          needsRedraw = true;
+          char logMsg[64];
+          sprintf(logMsg, "Cooled to %.1fC, close door, heating to %.0fC",
+                  (double)rawTemp, (double)nextTarget);
+          ReflowLog_Event(logMsg);
+        }
+        break;
+      }
+
+      case CAL_DONE:
+      case CAL_ABORTED:
+      {
+        uint16_t key = KEY_GetValue(1, &fullRect);
+        if (key == 0 || LCD_Enc_ReadBtn(200))
+        {
+          CLOSE_MENU();
+          break;
+        }
+        break;
+      }
+    }
+
+    // ---- Refresh display ----
+    if (nextScreenUpdate(500) || needsRedraw)
+    {
+      needsRedraw = false;
+
+      GUI_SetColor(infoSettings.bg_color);
+      GUI_FillRect(0, 0, LCD_WIDTH, LCD_HEIGHT);
+
+      // Title bar
+      GUI_SetColor(COLOR_TEXT);
+      _GUI_DispString(5, 5, (uint8_t *)"TC Calibration");
+      GUI_HLine(0, 25, LCD_WIDTH);
+
+      if (calState == CAL_INTRO)
+      {
+        uint16_t y = 40;
+        GUI_SetColor(COLOR_TEXT);
+        _GUI_DispString(10, y, (uint8_t *)"Place reference thermometer next to");
+        y += BYTE_HEIGHT + 2;
+        _GUI_DispString(10, y, (uint8_t *)"the board thermocouple probe inside oven.");
+
+        y += BYTE_HEIGHT + 12;
+        GUI_SetColor(YELLOW);
+        _GUI_DispString(10, y, (uint8_t *)"Heats to 6 points. ~15 min total.");
+
+        // Unit toggle button
+        y = 100;
+        GUI_SetColor(CYAN);
+        GUI_DrawRect(100, y, 380, y + 50);
+        sprintf(str, "Thermometer unit: [ %s ]", useFahrenheit ? "Fahrenheit" : "Celsius");
+        _GUI_DispStringInRect(100, y, 380, y + 50, (uint8_t *)str);
+
+        // Start button
+        y = 180;
+        GUI_SetColor(GREEN);
+        GUI_DrawRect(100, y, 380, y + 50);
+        _GUI_DispStringInRect(100, y, 380, y + 50, (uint8_t *)"[ START CALIBRATION ]");
+
+        // Current temp
+        y = 260;
+        GUI_SetColor(COLOR_TEXT);
+        sprintf(str, "Current sensor: %.1f C", (double)rawTemp);
+        _GUI_DispString(10, y, (uint8_t *)str);
+
+        // Show if calibration is loaded
+        const TC_Calibration *existing = MAX6675_GetCalibration();
+        y += BYTE_HEIGHT + 4;
+        if (existing->enabled)
+        {
+          GUI_SetColor(GREEN);
+          sprintf(str, "Active calibration: %d points", existing->numPoints);
+        }
+        else
+        {
+          GUI_SetColor(YELLOW);
+          sprintf(str, "No calibration loaded");
+        }
+        _GUI_DispString(10, y, (uint8_t *)str);
+      }
+      else if (calState == CAL_HEATING || calState == CAL_STABLE)
+      {
+        float target = calTargets[calStep];
+
+        GUI_SetColor(YELLOW);
+        sprintf(str, "Step %d of %d: Heating to %.0f C...",
+                calStep + 1, TC_CAL_POINTS, (double)target);
+        _GUI_DispString(10, 35, (uint8_t *)str);
+
+        // Large temp display
+        uint16_t y = 70;
+        GUI_SetColor(GREEN);
+        sprintf(str, "Sensor: %.1f C", (double)rawTemp);
+        _GUI_DispString(10, y, (uint8_t *)str);
+
+        y += BYTE_HEIGHT + 4;
+        GUI_SetColor(COLOR_TEXT);
+        sprintf(str, "Target: %.0f C   Duty: %.0f%%", (double)target, (double)calDuty);
+        _GUI_DispString(10, y, (uint8_t *)str);
+
+        y += BYTE_HEIGHT + 8;
+        if (calState == CAL_STABLE)
+        {
+          uint32_t waitLeft = 15 - (now - stableStartTime) / 1000;
+          if (waitLeft > 15) waitLeft = 15;
+          GUI_SetColor(CYAN);
+          sprintf(str, "Stabilizing... %lus remaining", (unsigned long)waitLeft);
+        }
+        else
+        {
+          GUI_SetColor(ORANGE);
+          sprintf(str, "Heating...");
+        }
+        _GUI_DispString(10, y, (uint8_t *)str);
+
+        // Progress bar
+        y += BYTE_HEIGHT + 8;
+        uint16_t barW = (uint16_t)((rawTemp / target) * 400.0f);
+        if (barW > 400) barW = 400;
+        GUI_SetColor(0x2104);
+        GUI_FillRect(40, y, 440, y + 12);
+        GUI_SetColor(GREEN);
+        GUI_FillRect(40, y, 40 + barW, y + 12);
+
+        // Abort hint
+        GUI_SetColor(COLOR_TEXT);
+        _GUI_DispStringInRect(0, LCD_HEIGHT - BYTE_HEIGHT - 5, LCD_WIDTH, LCD_HEIGHT,
+                              (uint8_t *)"Touch title bar to abort");
+      }
+      else if (calState == CAL_INPUT)
+      {
+        GUI_SetColor(GREEN);
+        sprintf(str, "Step %d of %d: %s", calStep + 1, TC_CAL_POINTS,
+                calStep == 0 ? "Ambient" : "Ready");
+        _GUI_DispString(10, 35, (uint8_t *)str);
+
+        // Sensor reading
+        uint16_t y = 60;
+        GUI_SetColor(COLOR_TEXT);
+        sprintf(str, "Sensor reads: %.1f C", (double)rawTemp);
+        _GUI_DispString(10, y, (uint8_t *)str);
+
+        if (calStep > 0)
+        {
+          sprintf(str, "(target was %.0f C)", (double)calTargets[calStep]);
+          _GUI_DispString(250, y, (uint8_t *)str);
+        }
+
+        // Instruction
+        y += BYTE_HEIGHT + 8;
+        GUI_SetColor(YELLOW);
+        sprintf(str, "Enter your thermometer reading (%s):",
+                useFahrenheit ? "F" : "C");
+        _GUI_DispString(10, y, (uint8_t *)str);
+
+        // Large input value display
+        y = 140;
+        GUI_SetColor(WHITE);
+        sprintf(str, "%d %s", inputValue, useFahrenheit ? "F" : "C");
+
+        // Center the large text
+        uint16_t textW = strlen(str) * BYTE_WIDTH * 2;
+        uint16_t textX = (LCD_WIDTH - textW) / 2;
+        // Draw at 2x size using filled rect background + text
+        GUI_SetColor(0x2104);
+        GUI_FillRect(textX - 10, y - 5, textX + textW + 10, y + BYTE_HEIGHT * 2 + 5);
+        GUI_SetColor(WHITE);
+        _GUI_DispStringInRect(0, y, LCD_WIDTH, y + BYTE_HEIGHT * 2, (uint8_t *)str);
+
+        // Show conversion to Celsius if in Fahrenheit mode
+        if (useFahrenheit)
+        {
+          float asC = ((float)inputValue - 32.0f) * 5.0f / 9.0f;
+          GUI_SetColor(CYAN);
+          sprintf(str, "= %.1f C", (double)asC);
+          _GUI_DispStringInRect(0, y + BYTE_HEIGHT * 2 + 2, LCD_WIDTH,
+                                y + BYTE_HEIGHT * 3 + 2, (uint8_t *)str);
+        }
+
+        // Draw buttons
+        // -10
+        GUI_SetColor(MAT_RED);
+        GUI_FillRect(btnMinus10.x0, btnMinus10.y0, btnMinus10.x1, btnMinus10.y1);
+        GUI_SetColor(WHITE);
+        _GUI_DispStringInRect(btnMinus10.x0, btnMinus10.y0, btnMinus10.x1, btnMinus10.y1,
+                              (uint8_t *)"-10");
+
+        // -1
+        GUI_SetColor(RED);
+        GUI_FillRect(btnMinus1.x0, btnMinus1.y0, btnMinus1.x1, btnMinus1.y1);
+        GUI_SetColor(WHITE);
+        _GUI_DispStringInRect(btnMinus1.x0, btnMinus1.y0, btnMinus1.x1, btnMinus1.y1,
+                              (uint8_t *)"-1");
+
+        // +1
+        GUI_SetColor(GREEN);
+        GUI_FillRect(btnPlus1.x0, btnPlus1.y0, btnPlus1.x1, btnPlus1.y1);
+        GUI_SetColor(BLACK);
+        _GUI_DispStringInRect(btnPlus1.x0, btnPlus1.y0, btnPlus1.x1, btnPlus1.y1,
+                              (uint8_t *)"+1");
+
+        // +10
+        GUI_SetColor(GREEN);
+        GUI_FillRect(btnPlus10.x0, btnPlus10.y0, btnPlus10.x1, btnPlus10.y1);
+        GUI_SetColor(BLACK);
+        _GUI_DispStringInRect(btnPlus10.x0, btnPlus10.y0, btnPlus10.x1, btnPlus10.y1,
+                              (uint8_t *)"+10");
+
+        // Confirm
+        GUI_SetColor(CYAN);
+        GUI_FillRect(btnConfirm.x0, btnConfirm.y0, btnConfirm.x1, btnConfirm.y1);
+        GUI_SetColor(BLACK);
+        _GUI_DispStringInRect(btnConfirm.x0, btnConfirm.y0, btnConfirm.x1, btnConfirm.y1,
+                              (uint8_t *)"CONFIRM");
+      }
+      else if (calState == CAL_DONE)
+      {
+        GUI_SetColor(GREEN);
+        _GUI_DispString(10, 40, (uint8_t *)"Calibration Complete!");
+        _GUI_DispString(10, 60, (uint8_t *)"Saved to TCAL.DAT on SD card.");
+
+        // Show calibration table
+        uint16_t y = 90;
+        GUI_SetColor(YELLOW);
+        _GUI_DispString(10, y, (uint8_t *)"Sensor C -> Actual C");
+        y += BYTE_HEIGHT + 4;
+
+        GUI_SetColor(COLOR_TEXT);
+        for (uint8_t i = 0; i < newCal.numPoints; i++)
+        {
+          sprintf(str, "  %.1f C  ->  %.1f C  (delta %.1f)",
+                  (double)newCal.points[i].sensorC,
+                  (double)newCal.points[i].actualC,
+                  (double)(newCal.points[i].actualC - newCal.points[i].sensorC));
+          _GUI_DispString(10, y, (uint8_t *)str);
+          y += BYTE_HEIGHT + 2;
+        }
+
+        y += 8;
+        GUI_SetColor(CYAN);
+        _GUI_DispString(10, y, (uint8_t *)"Calibration is now active.");
+        y += BYTE_HEIGHT + 4;
+        _GUI_DispString(10, y, (uint8_t *)"Touch to exit.");
+      }
+      else if (calState == CAL_COOLING)
+      {
+        float nextTarget = calTargets[calStep];
+        float aboveTarget = rawTemp - nextTarget;
+
+        GUI_SetColor(CYAN);
+        sprintf(str, "Step %d of %d: Cooling to %.0f C...",
+                calStep + 1, TC_CAL_POINTS, (double)nextTarget);
+        _GUI_DispString(10, 35, (uint8_t *)str);
+
+        // Large temp display
+        uint16_t y = 70;
+        GUI_SetColor(GREEN);
+        sprintf(str, "Sensor: %.1f C", (double)rawTemp);
+        _GUI_DispString(10, y, (uint8_t *)str);
+
+        y += BYTE_HEIGHT + 4;
+        GUI_SetColor(COLOR_TEXT);
+        sprintf(str, "Next target: %.0f C   (%.1f above)",
+                (double)nextTarget, (double)aboveTarget);
+        _GUI_DispString(10, y, (uint8_t *)str);
+
+        // Door instructions
+        y += BYTE_HEIGHT + 12;
+        if (aboveTarget > 20.0f)
+        {
+          GUI_SetColor(RED);
+          _GUI_DispString(10, y, (uint8_t *)">>> OPEN THE OVEN DOOR <<<");
+          y += BYTE_HEIGHT + 4;
+          GUI_SetColor(YELLOW);
+          _GUI_DispString(10, y, (uint8_t *)"Waiting for temp to drop...");
+        }
+        else
+        {
+          GUI_SetColor(GREEN);
+          _GUI_DispString(10, y, (uint8_t *)"Getting close...");
+          y += BYTE_HEIGHT + 4;
+          GUI_SetColor(YELLOW);
+          sprintf(str, "Close door at %.0f C (%.1f to go)",
+                  (double)(nextTarget + 10.0f), (double)(aboveTarget - 10.0f));
+          _GUI_DispString(10, y, (uint8_t *)str);
+        }
+
+        // Abort hint
+        GUI_SetColor(COLOR_TEXT);
+        _GUI_DispStringInRect(0, LCD_HEIGHT - BYTE_HEIGHT - 5, LCD_WIDTH, LCD_HEIGHT,
+                              (uint8_t *)"Touch title bar to abort");
+      }
+      else if (calState == CAL_ABORTED)
+      {
+        GUI_SetColor(YELLOW);
+        _GUI_DispString(10, 40, (uint8_t *)"Calibration aborted.");
+        _GUI_DispString(10, 60, (uint8_t *)"Previous calibration unchanged.");
+        _GUI_DispString(10, 100, (uint8_t *)"Touch to exit.");
+      }
+    }
+
+    loopProcess();
+  }
+
+  // Safety: ensure SSR off and stop logging
+  GPIO_SetLevel(SSR_PIN, SSR_ACTIVE_LOW ? 1 : 0);
+  if (ReflowLog_IsActive()) ReflowLog_Stop();
 }
 
 // =============================================================================

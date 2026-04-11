@@ -46,6 +46,9 @@ void menuReflowBurnIn(void);
 // Settings menu -- SSR polarity, safety limits, pin config
 void menuReflowSettings(void);
 
+// Thermocouple calibration -- multi-point calibration using reference thermometer
+void menuReflowCalibrate(void);
+
 #ifdef __cplusplus
 }
 #endif
