@@ -324,14 +324,29 @@ void Reflow_Update(void)
       if (!CheckSafety()) { ctrl.state = REFLOW_ERROR; break; }
 
       const ReflowStage *stage = &ctrl.profile.stages[ctrl.currentStage];
+      float diff = stage->targetTemp - ctrl.currentTemp;
+      uint32_t stageElapsed = (now - ctrl.stageStartTime) / 1000;
 
-      // Full power until within 10C of target, then PID takes over
-      if (ctrl.currentTemp < stage->targetTemp - 10.0f)
+      // Four-phase ramp to handle thermal inertia:
+      // Phase 1: 100% for first 5 seconds (kick thermal mass)
+      // Phase 2: 50% cruise until within 20°C
+      // Phase 3: 20% taper until within 10°C
+      // Phase 4: PID for last 10°C (gentle approach)
+      if (diff <= 0)
       {
-        ctrl.dutyCycle = PID_OUTPUT_MAX;
-        // Keep PID primed so transition is smooth
-        PID_Reset(&ctrl.pid);
-        ctrl.pid.output = PID_OUTPUT_MAX;
+        ctrl.dutyCycle = 0;  // above target — coast
+      }
+      else if (stageElapsed < 5)
+      {
+        ctrl.dutyCycle = PID_OUTPUT_MAX;  // initial kick
+      }
+      else if (diff > 20.0f)
+      {
+        ctrl.dutyCycle = 50.0f;  // cruise
+      }
+      else if (diff > 10.0f)
+      {
+        ctrl.dutyCycle = 20.0f;  // taper
       }
       else
       {
