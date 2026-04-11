@@ -801,7 +801,7 @@ void menuReflowBurnIn(void)
   PID_Controller burnPid;
   bool needsRedraw = true;
 
-  PID_Init(&burnPid, 0.48f, 0.0018f, 32.1f, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
+  PID_Init(&burnPid, 0.69f, 0.0028f, 42.5f, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
 
   ReflowLog_Start("burnin");
   char logMsg[48];
@@ -1106,7 +1106,7 @@ void menuReflowCalibrate(void)
 
   // PID for heating
   PID_Controller calPid;
-  PID_Init(&calPid, 0.48f, 0.0018f, 32.1f, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
+  PID_Init(&calPid, 0.69f, 0.0028f, 42.5f, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
   float calDuty = 0;
   uint32_t lastPidTime = OS_GetTimeMs();
 

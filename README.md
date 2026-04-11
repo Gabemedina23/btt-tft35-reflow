@@ -137,6 +137,52 @@ btt-tft35-reflow/
 └── firmware-base/            # BTT TouchScreen firmware (git submodule)
 ```
 
+## Heat Management: Dealing with Quartz Elements
+
+Cheap toaster ovens use **quartz infrared heating elements** that emit intense radiant heat. This creates a problem for reflow: the direct IR radiation heats dark PCB surfaces much hotter than what the thermocouple reads from the air, which can char boards even when the sensor says the temperature is correct.
+
+### The Problem
+
+With no shielding, our first lead-free reflow charred the board. The thermocouple (measuring air temperature near the board) read ~60C lower than the actual board surface temperature due to direct IR radiation from the quartz elements.
+
+### What We Tried
+
+**1. Solid steel baking tray** (from the toaster's original accessories)
+- Placed between the bottom elements and the board
+- The steel absorbs IR and re-radiates as gentler convective heat
+- Board temperature matched the reference thermometer well
+- **Problem**: Steel has very high thermal mass. At 50% duty cycle, the tray stored so much heat that when the heater shut off, temperature coasted **35-80C past the target**. The PID autotune showed 534-second oscillation periods and 87C peak-to-valley swings. Calibration at 50C overshot to 83C with the heater completely off.
+
+**2. Wire rack wrapped in aluminum foil** (current setup)
+- Standard oven wire rack wrapped loosely in aluminum foil
+- Foil reflects/absorbs IR from the quartz elements
+- Wire rack allows some airflow underneath (less thermal mass than solid steel)
+- A loose foil "tent" above the board shields from the top elements without trapping heat
+- **Result**: 40% less overshoot, 30% tighter PID oscillation (60C amplitude vs 87C), 15% faster heat-up. Board temp still tracks the reference thermometer accurately.
+
+### What Others Do
+
+- **Controleo3 / Whizoo builds**: Solid aluminum tray (high thermal conductivity, even heating). They also use insulation (Floor & Tunnel Shield II) on the oven walls.
+- **Commercial reflow ovens**: Perforated steel sheets to break up direct IR line-of-sight.
+- **Some DIY builds**: Replace quartz elements entirely with slower-responding metal elements.
+
+### Recommendations
+
+Pick your approach based on your oven and priorities:
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| Aluminum foil on wire rack | Cheap, low thermal mass, easy to adjust | Foil may tear over time, less uniform than solid plate |
+| Solid aluminum plate (~3mm) | Most uniform heating, best thermal conductivity | Adds thermal mass (better than steel though), costs more |
+| Solid steel tray | Free (comes with oven), good IR blocking | Very high thermal mass, huge overshoot, hard to control |
+| No shielding | Fastest heating | Will char boards, temperature readings don't match surface |
+
+**If you change your heat diffuser setup, re-run the PID autotune.** The thermal characteristics change significantly between setups -- our steel tray PID values were 8x too aggressive for the old setup and still needed adjustment after switching to aluminum foil.
+
+### Thermocouple Placement
+
+For best accuracy, tape or clip the thermocouple probe to the board or tray surface with kapton tape, not dangling in the air. The air temperature inside the oven can be 30-70C different from the board surface depending on your shielding setup.
+
 ## How It Works
 
 1. **The TFT35-E3 board IS the controller** -- no Arduino, no Raspberry Pi, no separate mainboard

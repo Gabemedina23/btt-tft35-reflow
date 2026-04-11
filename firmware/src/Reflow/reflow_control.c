@@ -190,7 +190,7 @@ void Reflow_Init(void)
   // Load thermocouple calibration from SD card (if available)
   MAX6675_LoadCalibration();
 
-  PID_Init(&ctrl.pid, 0.48f, 0.0018f, 32.1f, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
+  PID_Init(&ctrl.pid, 0.69f, 0.0028f, 42.5f, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
   PID_SetFeedForward(&ctrl.pid, 10.0f);
 }
 
