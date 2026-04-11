@@ -33,14 +33,14 @@ static const ReflowProfile profileLeadFree = {
   .stages = {
     { .name = "Preheat", .targetTemp = 150.0f, .rampRate =  2.0f, .holdTime = 0  },
     { .name = "Soak",    .targetTemp = 217.0f, .rampRate =  0.7f, .holdTime = 90 },
-    { .name = "Reflow",  .targetTemp = 250.0f, .rampRate =  2.0f, .holdTime = 0  },
-    { .name = "Peak",    .targetTemp = 250.0f, .rampRate =  0.0f, .holdTime = 15 },
+    { .name = "Reflow",  .targetTemp = 240.0f, .rampRate =  2.0f, .holdTime = 0  },
+    { .name = "Peak",    .targetTemp = 240.0f, .rampRate =  0.0f, .holdTime = 20 },
     { .name = "Cool",    .targetTemp =  50.0f, .rampRate = -3.0f, .holdTime = 0  },
   },
   .pidKp = 0.69f,
   .pidKi = 0.0028f,
   .pidKd = 42.5f,
-  .maxTemp = 280.0f,
+  .maxTemp = 270.0f,
   .stageTimeoutMult = 5.0f,
 };
 
