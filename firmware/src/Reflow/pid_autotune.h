@@ -69,8 +69,7 @@ typedef struct {
   uint32_t      maxDuration;      // Timeout (ms), default 10 minutes
 
   // Ramp-up phase tracking for initial heating
-  float         rampStartTemp;    // Temp when heating began
-  bool          rampPhase1Done;   // true once board temp rises 2°C
+  uint32_t      rampStartTime;    // Tick when heating began
 } AutotuneContext;
 
 // Initialize auto-tune context with defaults

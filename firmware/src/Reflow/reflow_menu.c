@@ -801,7 +801,7 @@ void menuReflowBurnIn(void)
   PID_Controller burnPid;
   bool needsRedraw = true;
 
-  PID_Init(&burnPid, 4.1f, 0.03f, 167.2f, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
+  PID_Init(&burnPid, 0.48f, 0.0018f, 32.1f, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
 
   ReflowLog_Start("burnin");
   char logMsg[48];
@@ -1106,7 +1106,7 @@ void menuReflowCalibrate(void)
 
   // PID for heating
   PID_Controller calPid;
-  PID_Init(&calPid, 4.1f, 0.03f, 167.2f, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
+  PID_Init(&calPid, 0.48f, 0.0018f, 32.1f, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
   float calDuty = 0;
   uint32_t lastPidTime = OS_GetTimeMs();
 
@@ -1119,11 +1119,11 @@ void menuReflowCalibrate(void)
   uint32_t lastLogTime = 0;
 
   // Ramp-up phase tracking:
-  // Phase 1: 25% duty until board temp rises 2°C (element warmup)
-  // Phase 2: 50% duty until within 10°C of target (cruise)
-  // Phase 3: 10% duty until target (gentle approach)
-  float rampStartTemp = 0;       // temp when heating began for this step
-  bool  rampPhase1Done = false;  // true once we've seen 2°C rise
+  // Phase 1: 100% for first 5 seconds (kick the thermal mass moving)
+  // Phase 2: 50% cruise until within 20°C of target
+  // Phase 3: 20% until within 10°C
+  // Phase 4: 10% gentle approach for last 10°C
+  uint32_t rampStartTime = 0;    // when heating began for this step
 
   // Door state tracking for cooling
   bool doorOpenPrompted = false;
@@ -1154,27 +1154,31 @@ void menuReflowCalibrate(void)
         float target = calTargets[calStep];
         float diff = target - rawTemp;
 
-        // Three-phase ramp-up to handle massive thermal inertia of steel tray:
-        // Phase 1: 25% duty until board temp rises 2°C → proves element is warming tray
-        // Phase 2: 50% duty until within 10°C of target → main cruise heating
-        // Phase 3: 10% duty until target → gentle approach, let stored heat coast in
+        // Four-phase ramp-up tuned for steel tray thermal mass:
+        // Phase 1: 100% for first 5 seconds (kick the thermal mass moving)
+        // Phase 2: 50% cruise until within 20°C of target
+        // Phase 3: 20% taper until within 10°C
+        // Phase 4: 10% gentle approach for last 10°C
+        uint32_t rampElapsed = (now - rampStartTime) / 1000;
         if (diff <= 0)
         {
           calDuty = 0;  // above target — heater fully off
         }
-        else if (!rampPhase1Done)
+        else if (rampElapsed < 5)
         {
-          calDuty = 25.0f;
-          if (rawTemp >= rampStartTemp + 2.0f)
-            rampPhase1Done = true;
+          calDuty = 100.0f;  // initial kick
+        }
+        else if (diff > 20.0f)
+        {
+          calDuty = 50.0f;  // cruise
         }
         else if (diff > 10.0f)
         {
-          calDuty = 50.0f;  // cruise phase
+          calDuty = 20.0f;  // taper
         }
         else
         {
-          calDuty = 10.0f;  // gentle approach for last 10°C
+          calDuty = 10.0f;  // gentle approach
         }
 
         // Track temperature swings
@@ -1275,8 +1279,7 @@ void menuReflowCalibrate(void)
             PID_Reset(&calPid);
             heatingPeakTemp = rawTemp;
             heatingMinTemp = rawTemp;
-            rampStartTemp = rawTemp;
-            rampPhase1Done = false;
+            rampStartTime = now;
           }
           needsRedraw = true;
           Buzzer_Play(SOUND_OK);
@@ -1449,8 +1452,7 @@ void menuReflowCalibrate(void)
               PID_Reset(&calPid);
               heatingPeakTemp = rawTemp;
               heatingMinTemp = rawTemp;
-              rampStartTemp = rawTemp;
-              rampPhase1Done = false;
+              rampStartTime = now;
               overshootDoorOpen = false;
             }
           }
@@ -1490,8 +1492,7 @@ void menuReflowCalibrate(void)
           PID_Reset(&calPid);
           heatingPeakTemp = rawTemp;
           heatingMinTemp = rawTemp;
-          rampStartTemp = rawTemp;
-          rampPhase1Done = false;
+          rampStartTime = now;
           overshootDoorOpen = false;
           Buzzer_Play(SOUND_NOTIFY);
           needsRedraw = true;
@@ -1617,13 +1618,18 @@ void menuReflowCalibrate(void)
         else
         {
           GUI_SetColor(ORANGE);
-          if (!rampPhase1Done)
-            sprintf(str, "Warming up (25%%)... +%.1fC",
-                    (double)(rawTemp - rampStartTemp));
-          else if (target - rawTemp > 10.0f)
-            sprintf(str, "Heating (50%%)...");
-          else
-            sprintf(str, "Approaching (10%%)...");
+          {
+            uint32_t re = (now - rampStartTime) / 1000;
+            float d = target - rawTemp;
+            if (re < 5)
+              sprintf(str, "Kick (100%%) %lus...", (unsigned long)(5 - re));
+            else if (d > 20.0f)
+              sprintf(str, "Cruise (50%%)...");
+            else if (d > 10.0f)
+              sprintf(str, "Taper (20%%)...");
+            else
+              sprintf(str, "Approach (10%%)...");
+          }
           _GUI_DispString(10, y, (uint8_t *)str);
         }
 

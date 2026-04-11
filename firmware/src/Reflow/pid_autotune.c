@@ -36,8 +36,7 @@ void Autotune_Start(AutotuneContext *ctx)
   ctx->currentPeak = 0.0f;
   ctx->currentValley = 9999.0f;
   ctx->startTime = OS_GetTimeMs();
-  ctx->rampStartTemp = -999.0f;  // will be set on first update
-  ctx->rampPhase1Done = false;
+  ctx->rampStartTime = OS_GetTimeMs();
 }
 
 float Autotune_Update(AutotuneContext *ctx, float currentTemp)
@@ -59,14 +58,13 @@ float Autotune_Update(AutotuneContext *ctx, float currentTemp)
   {
     case AUTOTUNE_HEATING:
     {
-      // Three-phase ramp to target to avoid massive thermal overshoot:
-      // Phase 1: 25% until board temp rises 2°C (element warmup)
-      // Phase 2: 50% cruise until within 10°C of target
-      // Phase 3: 10% gentle approach for last 10°C
-      if (ctx->rampStartTemp < -900.0f)
-        ctx->rampStartTemp = currentTemp;  // capture starting temp on first call
-
+      // Four-phase ramp tuned for steel tray thermal mass:
+      // Phase 1: 100% for first 5 seconds (kick the mass moving)
+      // Phase 2: 50% cruise until within 20°C of target
+      // Phase 3: 20% taper until within 10°C
+      // Phase 4: 10% gentle approach for last 10°C
       float diff = ctx->targetTemp - currentTemp;
+      uint32_t rampElapsed = (OS_GetTimeMs() - ctx->rampStartTime) / 1000;
 
       if (diff <= 0)
       {
@@ -76,15 +74,17 @@ float Autotune_Update(AutotuneContext *ctx, float currentTemp)
         ctx->currentPeak = currentTemp;
         ctx->currentValley = 9999.0f;
       }
-      else if (!ctx->rampPhase1Done)
+      else if (rampElapsed < 5)
       {
-        output = 25.0f;
-        if (currentTemp >= ctx->rampStartTemp + 2.0f)
-          ctx->rampPhase1Done = true;
+        output = 100.0f;  // initial kick
+      }
+      else if (diff > 20.0f)
+      {
+        output = 50.0f;  // cruise
       }
       else if (diff > 10.0f)
       {
-        output = 50.0f;  // cruise
+        output = 20.0f;  // taper
       }
       else
       {
