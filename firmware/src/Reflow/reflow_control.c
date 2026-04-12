@@ -319,6 +319,50 @@ void Reflow_Update(void)
     }
 
     case REFLOW_PREHEAT:
+    {
+      if (!CheckSafety()) { ctrl.state = REFLOW_ERROR; break; }
+
+      const ReflowStage *stage = &ctrl.profile.stages[ctrl.currentStage];
+      float diff = stage->targetTemp - ctrl.currentTemp;
+      uint32_t stageElapsed = (now - ctrl.stageStartTime) / 1000;
+
+      // Preheat: aggressive ramp — no heat-sensitive concern below 150°C
+      // Phase 1: 100% kick for 10s
+      // Phase 2: 100% cruise until within 10°C (fast — nothing to damage)
+      // Phase 3: PID for last 10°C
+      if (diff <= 0)
+      {
+        ctrl.dutyCycle = 0;
+      }
+      else if (stageElapsed < 10)
+      {
+        ctrl.dutyCycle = PID_OUTPUT_MAX;
+      }
+      else if (diff > 10.0f)
+      {
+        ctrl.dutyCycle = PID_OUTPUT_MAX;  // full power — safe at low temps
+      }
+      else
+      {
+        ctrl.dutyCycle = PID_ComputeWithRamp(&ctrl.pid, ctrl.currentTemp,
+                                              stage->targetTemp, stage->rampRate, dt);
+      }
+
+      if (ctrl.currentTemp >= stage->targetTemp - 1.0f)
+      {
+        if (stage->holdTime > 0)
+        {
+          ctrl.state = REFLOW_SOAK;
+          ctrl.stageStartTime = OS_GetTimeMs();
+        }
+        else
+        {
+          AdvanceStage();
+        }
+      }
+      break;
+    }
+
     case REFLOW_RAMP:
     {
       if (!CheckSafety()) { ctrl.state = REFLOW_ERROR; break; }
@@ -327,26 +371,23 @@ void Reflow_Update(void)
       float diff = stage->targetTemp - ctrl.currentTemp;
       uint32_t stageElapsed = (now - ctrl.stageStartTime) / 1000;
 
-      // Four-phase ramp to handle thermal inertia:
-      // Phase 1: 100% for first 5 seconds (kick thermal mass)
-      // Phase 2: 50% cruise until within 20°C
-      // Phase 3: 20% taper until within 10°C
-      // Phase 4: PID for last 10°C (gentle approach)
+      // Reflow ramp: cascading power down as we approach target
+      // 100% kick for 10s, 75% until within 15°C, 50% until within 5°C, PID last 5°C
       if (diff <= 0)
       {
-        ctrl.dutyCycle = 0;  // above target — coast
+        ctrl.dutyCycle = 0;
       }
-      else if (stageElapsed < 5)
+      else if (stageElapsed < 10)
       {
-        ctrl.dutyCycle = PID_OUTPUT_MAX;  // initial kick
+        ctrl.dutyCycle = PID_OUTPUT_MAX;  // kick
       }
-      else if (diff > 20.0f)
+      else if (diff > 15.0f)
+      {
+        ctrl.dutyCycle = 75.0f;  // high cruise
+      }
+      else if (diff > 5.0f)
       {
         ctrl.dutyCycle = 50.0f;  // cruise
-      }
-      else if (diff > 10.0f)
-      {
-        ctrl.dutyCycle = 20.0f;  // taper
       }
       else
       {
@@ -354,7 +395,6 @@ void Reflow_Update(void)
                                               stage->targetTemp, stage->rampRate, dt);
       }
 
-      // Check if we've reached the target temperature
       if (ctrl.currentTemp >= stage->targetTemp - 1.0f)
       {
         if (stage->holdTime > 0)
