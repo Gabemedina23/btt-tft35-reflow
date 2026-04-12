@@ -22,7 +22,7 @@ static const ReflowProfile profileLeaded = {
   .pidKi = 0.0028f,
   .pidKd = 42.5f,
   .maxTemp = 260.0f,
-  .stageTimeoutMult = 8.0f,
+  .stageTimeoutMult = 15.0f,
 };
 
 static const ReflowProfile profileLeadFree = {
@@ -41,7 +41,7 @@ static const ReflowProfile profileLeadFree = {
   .pidKi = 0.0028f,
   .pidKd = 42.5f,
   .maxTemp = 270.0f,
-  .stageTimeoutMult = 8.0f,
+  .stageTimeoutMult = 15.0f,
 };
 
 const ReflowProfile * Profile_GetLeaded(void)
