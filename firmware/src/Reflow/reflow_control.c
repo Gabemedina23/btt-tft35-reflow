@@ -326,11 +326,12 @@ void Reflow_Update(void)
       float diff = stage->targetTemp - ctrl.currentTemp;
       uint32_t stageElapsed = (now - ctrl.stageStartTime) / 1000;
 
-      // Preheat: aggressive ramp — no heat-sensitive concern below 150°C
-      // Phase 1: 100% kick for 10s
-      // Phase 2: 100% cruise until within 10°C (fast — nothing to damage)
-      // Phase 3: PID for last 10°C
-      if (diff <= 0)
+      // Preheat: aggressive ramp, cut heater at cutoff and coast to target
+      if (stage->heaterCutoff > 0 && ctrl.currentTemp >= stage->heaterCutoff)
+      {
+        ctrl.dutyCycle = 0;  // coast — thermal inertia carries to target
+      }
+      else if (diff <= 0)
       {
         ctrl.dutyCycle = 0;
       }
@@ -338,14 +339,9 @@ void Reflow_Update(void)
       {
         ctrl.dutyCycle = PID_OUTPUT_MAX;
       }
-      else if (diff > 10.0f)
-      {
-        ctrl.dutyCycle = PID_OUTPUT_MAX;  // full power — safe at low temps
-      }
       else
       {
-        ctrl.dutyCycle = PID_ComputeWithRamp(&ctrl.pid, ctrl.currentTemp,
-                                              stage->targetTemp, stage->rampRate, dt);
+        ctrl.dutyCycle = PID_OUTPUT_MAX;  // full power until cutoff
       }
 
       if (ctrl.currentTemp >= stage->targetTemp - 1.0f)
@@ -371,9 +367,12 @@ void Reflow_Update(void)
       float diff = stage->targetTemp - ctrl.currentTemp;
       uint32_t stageElapsed = (now - ctrl.stageStartTime) / 1000;
 
-      // Reflow ramp: cascading power down as we approach target
-      // 100% kick for 10s, 75% until within 15°C, 50% until within 5°C, PID last 5°C
-      if (diff <= 0)
+      // Reflow ramp: cascading power, cut heater at cutoff and coast to target
+      if (stage->heaterCutoff > 0 && ctrl.currentTemp >= stage->heaterCutoff)
+      {
+        ctrl.dutyCycle = 0;  // coast — thermal inertia carries to target
+      }
+      else if (diff <= 0)
       {
         ctrl.dutyCycle = 0;
       }

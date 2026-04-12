@@ -18,6 +18,7 @@ typedef struct {
   float    targetTemp;             // Target temperature (C) at end of this stage
   float    rampRate;               // Desired ramp rate (C/s). 0 = hold. Negative = cool.
   uint16_t holdTime;               // Seconds to hold at targetTemp after reaching it
+  float    heaterCutoff;           // Kill heater at this temp and coast to targetTemp (0 = disabled)
 } ReflowStage;
 
 // Complete reflow profile
