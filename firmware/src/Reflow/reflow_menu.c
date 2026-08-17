@@ -335,7 +335,7 @@ void menuReflowMain(void)
       {ICON_FEATURE_SETTINGS,        {.address = (void *)"Auto Tune"}},
       {ICON_SCREEN_INFO,             {.address = (void *)"Monitor"}},
       {ICON_SETTINGS,                {.address = (void *)"Settings"}},
-      {ICON_HEAT_FAN,                {.address = (void *)"Burn-In"}},
+      {ICON_HEAT_FAN,                {.address = (void *)"Heat & Hold"}},
       {ICON_FEATURE_SETTINGS,        {.address = (void *)"Calibrate"}},
       {ICON_NULL,                    {.index = LABEL_NULL}},
     }
@@ -796,22 +796,136 @@ void menuReflowBurnIn(void)
   const GUI_RECT fullRect = {0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1};
   char str[64];
   bool running = true;
+  int   targetInt = 150;          // user-selected target in C
   float targetTemp = 150.0f;
   float dutyCycle = 0.0f;
   PID_Controller burnPid;
   bool needsRedraw = true;
+  bool overheatCutoff = false;    // tripped when board > target+30, resets at target-5
 
-  PID_Init(&burnPid, 0.69f, 0.0028f, 42.5f, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
-
-  ReflowLog_Start("burnin");
-  char logMsg[48];
-  sprintf(logMsg, "Burn-in started at %.0fC", (double)targetTemp);
-  ReflowLog_Event(logMsg);
-
-  // SSR already initialized by Reflow_Init() at boot
+  // Target picker buttons (same layout as calibration input screen)
+  const GUI_RECT pickMinus10 = {  20, 220, 110, 265 };
+  const GUI_RECT pickMinus1  = { 120, 220, 210, 265 };
+  const GUI_RECT pickPlus1   = { 270, 220, 360, 265 };
+  const GUI_RECT pickPlus10  = { 370, 220, 460, 265 };
+  const GUI_RECT pickStart   = { 140, 275, 340, 315 };
+  const GUI_RECT pickAbort   = {   0,   0, LCD_WIDTH - 1, 25 };
+  bool pickerNeedsRedraw = true;
 
   GUI_Clear(infoSettings.bg_color);
   setMenu(MENU_TYPE_FULLSCREEN, NULL, 1, &fullRect, NULL, NULL);
+  #if LCD_ENCODER_SUPPORT
+    encoderPosition = 0;
+  #endif
+
+  // ---- Phase 1: Target temperature picker ----
+  while (MENU_IS(menuReflowBurnIn))
+  {
+    MAX6675_Update();
+    float boardTemp = MAX6675_GetFilteredTemp(TC_BOARD);
+
+    #if LCD_ENCODER_SUPPORT
+    {
+      int16_t encDelta = encoderPosition;
+      if (encDelta != 0)
+      {
+        encoderPosition = 0;
+        targetInt += encDelta;
+        pickerNeedsRedraw = true;
+      }
+    }
+    #endif
+
+    const GUI_RECT pickZones[] = {
+      pickMinus10, pickMinus1, pickPlus1, pickPlus10, pickStart, pickAbort
+    };
+    uint16_t pk = KEY_GetValue(6, pickZones);
+    bool encClick = LCD_Enc_ReadBtn(200);
+
+    switch (pk)
+    {
+      case 0: targetInt -= 10; pickerNeedsRedraw = true; break;
+      case 1: targetInt -= 1;  pickerNeedsRedraw = true; break;
+      case 2: targetInt += 1;  pickerNeedsRedraw = true; break;
+      case 3: targetInt += 10; pickerNeedsRedraw = true; break;
+      case 5:  // Abort (title bar)
+        CLOSE_MENU();
+        return;
+      default: break;
+    }
+
+    if (targetInt < 50)  targetInt = 50;
+    if (targetInt > 250) targetInt = 250;
+
+    if (pk == 4 || encClick)     // Start
+    {
+      targetTemp = (float)targetInt;
+      Buzzer_Play(SOUND_OK);
+      break;
+    }
+
+    if (pickerNeedsRedraw)
+    {
+      pickerNeedsRedraw = false;
+
+      GUI_SetColor(infoSettings.bg_color);
+      GUI_FillRect(0, 0, LCD_WIDTH, LCD_HEIGHT);
+
+      GUI_SetColor(MAT_RED);
+      _GUI_DispStringInRect(pickAbort.x0, pickAbort.y0, pickAbort.x1, pickAbort.y1,
+                            (uint8_t *)"Tap top bar to cancel");
+
+      GUI_SetColor(COLOR_TEXT);
+      _GUI_DispString(10, 40, (uint8_t *)"Heat & Hold - Set Target Temp");
+      GUI_HLine(0, 68, LCD_WIDTH);
+
+      GUI_SetColor(GREEN);
+      sprintf(str, "%d C", targetInt);
+      _GUI_DispString(180, 100, (uint8_t *)str);
+
+      GUI_SetColor(CYAN);
+      sprintf(str, "Board now: %.1f C", (double)boardTemp);
+      _GUI_DispString(10, 170, (uint8_t *)str);
+
+      GUI_SetColor(YELLOW);
+      _GUI_DispString(10, 195, (uint8_t *)"Range 50-250 C. Encoder dial = +/-1.");
+
+      // Buttons -10 / -1 / +1 / +10
+      GUI_SetColor(MAT_BLUE);
+      GUI_FillRect(pickMinus10.x0, pickMinus10.y0, pickMinus10.x1, pickMinus10.y1);
+      GUI_FillRect(pickMinus1.x0,  pickMinus1.y0,  pickMinus1.x1,  pickMinus1.y1);
+      GUI_FillRect(pickPlus1.x0,   pickPlus1.y0,   pickPlus1.x1,   pickPlus1.y1);
+      GUI_FillRect(pickPlus10.x0,  pickPlus10.y0,  pickPlus10.x1,  pickPlus10.y1);
+      GUI_SetColor(WHITE);
+      _GUI_DispStringInRect(pickMinus10.x0, pickMinus10.y0, pickMinus10.x1, pickMinus10.y1, (uint8_t *)"-10");
+      _GUI_DispStringInRect(pickMinus1.x0,  pickMinus1.y0,  pickMinus1.x1,  pickMinus1.y1,  (uint8_t *)"-1");
+      _GUI_DispStringInRect(pickPlus1.x0,   pickPlus1.y0,   pickPlus1.x1,   pickPlus1.y1,   (uint8_t *)"+1");
+      _GUI_DispStringInRect(pickPlus10.x0,  pickPlus10.y0,  pickPlus10.x1,  pickPlus10.y1,  (uint8_t *)"+10");
+
+      // Start button
+      GUI_SetColor(GREEN);
+      GUI_FillRect(pickStart.x0, pickStart.y0, pickStart.x1, pickStart.y1);
+      GUI_SetColor(BLACK);
+      _GUI_DispStringInRect(pickStart.x0, pickStart.y0, pickStart.x1, pickStart.y1, (uint8_t *)"START");
+    }
+
+    loopProcess();
+  }
+
+  if (!MENU_IS(menuReflowBurnIn)) return;
+
+  // ---- Phase 2: Heat & Hold loop ----
+  PID_Init(&burnPid, 4.1f, 0.03f, 146.2f, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
+
+  char sessionName[16];
+  sprintf(sessionName, "hold-%d", targetInt);
+  ReflowLog_Start(sessionName);
+  char logMsg[48];
+  sprintf(logMsg, "Heat & Hold started at %dC", targetInt);
+  ReflowLog_Event(logMsg);
+
+  GUI_Clear(infoSettings.bg_color);
+  needsRedraw = true;
 
   uint32_t startTime = OS_GetTimeMs();
   uint32_t lastPidTime = OS_GetTimeMs();
@@ -823,13 +937,31 @@ void menuReflowBurnIn(void)
     float ambientTemp = MAX6675_GetFilteredTemp(TC_AMBIENT);
     uint32_t now = OS_GetTimeMs();
 
+    // Safety: hard overshoot cutoff at target+30C, resume at target-5C
+    if (running)
+    {
+      if (!overheatCutoff && boardTemp > targetTemp + 30.0f)
+      {
+        overheatCutoff = true;
+        ReflowLog_Event("Overheat cutoff: board > target+30C");
+        Buzzer_Play(SOUND_ERROR);
+      }
+      else if (overheatCutoff && boardTemp < targetTemp - 5.0f)
+      {
+        overheatCutoff = false;
+        ReflowLog_Event("Overheat cutoff cleared");
+      }
+    }
+
     // PID control at 2Hz
     if (running && (now - lastPidTime) >= PID_UPDATE_INTERVAL_MS)
     {
       float dt = (float)(now - lastPidTime) / 1000.0f;
       lastPidTime = now;
 
-      if (boardTemp < targetTemp - 10.0f)
+      if (overheatCutoff)
+        dutyCycle = 0.0f;
+      else if (boardTemp < targetTemp - 10.0f)
         dutyCycle = PID_OUTPUT_MAX;
       else
         dutyCycle = PID_Compute(&burnPid, boardTemp, targetTemp, dt);
@@ -838,7 +970,8 @@ void menuReflowBurnIn(void)
       static bool logToggle = false;
       logToggle = !logToggle;
       if (logToggle)
-        ReflowLog_Write(boardTemp, ambientTemp, targetTemp, dutyCycle, "BurnIn", "Hold");
+        ReflowLog_Write(boardTemp, ambientTemp, targetTemp, dutyCycle,
+                        overheatCutoff ? "Cutoff" : "Hold", "Hold");
     }
 
     // SSR PWM
@@ -863,7 +996,7 @@ void menuReflowBurnIn(void)
         running = false;
         dutyCycle = 0.0f;
         GPIO_SetLevel(SSR_PIN, SSR_ACTIVE_LOW ? 1 : 0);
-        ReflowLog_Event("Burn-in stopped by user");
+        ReflowLog_Event("Heat & Hold stopped by user");
         ReflowLog_Stop();
         Buzzer_Play(SOUND_OK);
       }
@@ -884,13 +1017,14 @@ void menuReflowBurnIn(void)
       GUI_FillRect(0, 0, LCD_WIDTH, LCD_HEIGHT);
 
       GUI_SetColor(COLOR_TEXT);
-      _GUI_DispString(5, 5, (uint8_t *)"Oven Burn-In (Off-Gas Mode)");
+      sprintf(str, "Heat & Hold @ %d C", targetInt);
+      _GUI_DispString(5, 5, (uint8_t *)str);
       GUI_HLine(0, 28, LCD_WIDTH);
 
       uint16_t y = 40;
 
       // Large temp display
-      GUI_SetColor(running ? GREEN : YELLOW);
+      GUI_SetColor(overheatCutoff ? RED : (running ? GREEN : YELLOW));
       sprintf(str, "Board: %.1f C", (double)boardTemp);
       _GUI_DispString(10, y, (uint8_t *)str);
       sprintf(str, "/ %.0f C", (double)targetTemp);
@@ -903,7 +1037,8 @@ void menuReflowBurnIn(void)
 
       y += BYTE_HEIGHT + 4;
       GUI_SetColor(COLOR_TEXT);
-      sprintf(str, "Duty: %.0f%%    SSR: %s", (double)dutyCycle, running ? "ACTIVE" : "OFF");
+      sprintf(str, "Duty: %.0f%%    SSR: %s", (double)dutyCycle,
+              !running ? "OFF" : (overheatCutoff ? "CUTOFF" : "ACTIVE"));
       _GUI_DispString(10, y, (uint8_t *)str);
 
       y += BYTE_HEIGHT + 4;
@@ -914,17 +1049,22 @@ void menuReflowBurnIn(void)
       _GUI_DispString(10, y, (uint8_t *)str);
 
       y += BYTE_HEIGHT + 8;
-      if (running)
+      if (overheatCutoff)
+      {
+        GUI_SetColor(RED);
+        _GUI_DispString(10, y, (uint8_t *)"OVERHEAT CUTOFF - SSR off");
+        y += BYTE_HEIGHT + 4;
+        _GUI_DispString(10, y, (uint8_t *)"Waiting for board to drop");
+      }
+      else if (running)
       {
         GUI_SetColor(YELLOW);
-        _GUI_DispString(10, y, (uint8_t *)"Let oven run until smoke stops.");
-        y += BYTE_HEIGHT + 4;
-        _GUI_DispString(10, y, (uint8_t *)"Open a window or do this in garage!");
+        _GUI_DispString(10, y, (uint8_t *)"Holding at target. Click/touch to stop.");
       }
       else
       {
         GUI_SetColor(GREEN);
-        _GUI_DispString(10, y, (uint8_t *)"Burn-in stopped. Oven cooling.");
+        _GUI_DispString(10, y, (uint8_t *)"Stopped. Oven cooling.");
         y += BYTE_HEIGHT + 4;
         _GUI_DispString(10, y, (uint8_t *)"Touch again to exit.");
       }
@@ -942,7 +1082,7 @@ void menuReflowBurnIn(void)
       GUI_SetColor(COLOR_TEXT);
       GUI_HLine(0, LCD_HEIGHT - (BYTE_HEIGHT * 2), LCD_WIDTH);
       _GUI_DispStringInRect(0, LCD_HEIGHT - (BYTE_HEIGHT * 2), LCD_WIDTH, LCD_HEIGHT,
-                            (uint8_t *)(running ? "Touch to stop burn-in" : "Touch to exit"));
+                            (uint8_t *)(running ? "Touch to stop Heat & Hold" : "Touch to exit"));
     }
 
     loopProcess();
@@ -1106,7 +1246,7 @@ void menuReflowCalibrate(void)
 
   // PID for heating
   PID_Controller calPid;
-  PID_Init(&calPid, 0.69f, 0.0028f, 42.5f, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
+  PID_Init(&calPid, 4.1f, 0.03f, 146.2f, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
   float calDuty = 0;
   uint32_t lastPidTime = OS_GetTimeMs();
 

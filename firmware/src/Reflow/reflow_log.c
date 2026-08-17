@@ -81,12 +81,10 @@ void ReflowLog_Write(float boardTemp, float ambientTemp, float targetTemp,
 
   UINT bw;
   f_write(&logFile, row, strlen(row), &bw);
-
   logRowCount++;
 
-  // Sync to SD every 10 rows to avoid data loss without killing performance
-  if ((logRowCount % 10) == 0)
-    f_sync(&logFile);
+  // Sync every row so both FAT copies + dir entry stay current — survives card yank
+  f_sync(&logFile);
 }
 
 void ReflowLog_Event(const char *event)

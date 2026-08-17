@@ -1,8 +1,35 @@
 # Reflow Oven TODO
 
 ## In Progress
-- [ ] **Run thermocouple calibration** — Run calibration with aluminum foil wire rack setup, verify readings match reference thermometer
-- [ ] **Test reflow with calibrated sensor** — After calibration, do a test reflow on a sacrificial board to verify temps are correct
+- [ ] **Fine-tune campaign (2026-08-17):** SD card cleared AM (old logs → `logs/2026-08-17-sd-archive/` — ⚠️ CORRECTION: those 3 files are md5-identical to `logs/2026-05-26-sac305/`, i.e. a re-archive of the May-26 session, not new data; the earlier "not dupes" note compared the wrong baseline). **2 genuinely new SAC305 runs recorded + pulled same day → `logs/2026-08-17-fresh-runs/`** (both truncated mid-Cool — let the oven finish cooling before pulling the card next time). **Full trend analysis → [`docs/2026-08-17-log-trend-analysis.md`](./docs/2026-08-17-log-trend-analysis.md)**: no drift vs May-26, tight A/B repeatability, TAL/peak in spec; soak genuinely short (29–55s in-band) but it's a passive coast at ~0% duty toward an unreachable 200°C target — more time alone won't fix; reflow ramp actuator-limited (full-duty ceiling 0.12–0.22°C/s above 180°C — the "~0.7°C/s" note below is the 120–150°C band, not high temps).
+- [x] **✅ RESOLVED 2026-08-17 — firmware/repo drift reconciled.** Real source found: `firmware-base/TFT/src/User/Reflow/` (the gitignored buildable tree) — provenance PROVEN by md5: SD card's flashed `.CUR` == `firmware-base/.pio/build/` binary (`7ac7de55…`), no post-build source edits. Drift = the entire May-26 session (autotune PID 4.1/0.03/146.2, lowered SAC305 200/60+235, per-row f_sync, Heat & Hold mode) applied only in the build tree. All 4 files synced into tracked `firmware/src/Reflow/` (now byte-identical), vendor-file hooks captured as `firmware/vendor-integration.patch` (upstream pinned at `3c46b69`), rebuild recipe + **sync rule** in `firmware/README.md` — that rule is the root-cause fix, follow it after every flashed change.
+- [ ] **(Optional, after reconcile) Active soak decision:** if a true isothermal soak is wanted, hold at a reachable ~165–170°C with non-zero duty instead of coasting at 200°C target; SAC305 tolerates the current ramp-to-spike behavior, so this is a choice, not a defect. RampRate cosmetic fix should be **0.5–0.6**°C/s, not the 0.8 in the item below.
+- [x] **Test reflow with lowered profile** — VALIDATED 2026-05-26 (RFLOW_02). Peak 239.7°C, TAL 51s, full 5-stage profile completed cleanly. Log since deleted; surviving reflow logs in `~/claude/archive/2026-05-reflow-logs/`.
+- [ ] **(Cosmetic) Lower Reflow stage rampRate** from 2.0°C/s to 0.8°C/s in reflow_profile.c — oven physically can't ramp faster than ~0.7°C/s at high temps. No functional impact, just makes the spec match reality.
+- [ ] **Servo-controlled oven door** — auto crack/open/close per stage (see Future section)
+- [ ] **Replace SD card** — current 64 GB card showing flaky USB enumeration after pull-cycles. BTT recommends ≤8 GB. Replace before extended logging.
+
+## Completed (2026-05-26)
+- [x] **New fine-wire patch K-type TC installed** — Slice BN thermal paste + kapton on sacrificial coupon top, fiberglass-encapsulated wire run. Mounting verified by paste-melt test.
+- [x] **TCAL.DAT removed, calibration NOT rebuilt** — paste-melt test confirmed TC reads accurately at 217°C without calibration. The 6-point TCAL was patching a problem (camera-derived misdiagnosis) that didn't exist. No calibration needed.
+- [x] **TC validated via SAC305 paste-melt** — TC reads 215-218°C when paste actually melts (SAC305 eutectic 217°C). Accurate to ±2°C at the temp that matters.
+- [x] **Camera unreliability confirmed** — Thermal Master over-reads in oven (pixel-area averaging + cal bias), under-reads water surface. Not usable as truth source.
+- [x] **Heat & Hold mode added** — user-selectable target 50-250°C, replaces fixed Burn-In, with target+30°C safety cutoff. See memory `project_reflow_oven.md`.
+- [x] **PID values updated to autotune output** — Kp=4.1, Ki=0.03, Kd=146.2 (was 0.69/0.0028/42.5). Applied across all heating modes.
+- [x] **SD log durability fix** — f_sync now runs every row (was every 10). Lost-log recovery from prior FAT corruption: `temp/rflow_recovered/RFLOW_00-10.CSV` (since deleted; surviving logs in `~/claude/archive/2026-05-reflow-logs/`).
+
+## Completed (2026-05-24)
+- [x] Validated TC reading vs thermal camera (Thermal Master) — board TC tracked ambient TC ±2 °C during burn-in while camera showed +70 °C delta on board surface
+- [x] Root-caused TC issue: M6 ring-terminal probe-style TC has wrong thermal characteristics for PCB surface measurement (slow response, no exposed bead, steel-braid heat-sink). Paste + kapton + top-mount alone can't fix it.
+- [x] Established calibration coupon methodology (thermal twin) — saved to memory `project_reflow_oven.md`. Sacrificial populated reject per PCB design, top-surface TC bonding via Slice BN paste + kapton (silicone-free, 360 °C continuous), ≥2 cm flat wire run, dual-TC role split (chamber PID vs board profile).
+- [x] CSV logs pulled and archived: `archive/2026-05-reflow-logs/RFLOW_00_thermalcam_run.csv` (pre-paste), `archive/2026-05-reflow-logs/RFLOW_01_post_paste.csv` (post-paste, same flawed M6 ring TC)
+
+## Completed (2026-04-13)
+- [x] SAC305 profile lowered to minimum spec: soak 200°C/60s, peak 235°C/10s, cutoff 230°C, maxTemp 255°C
+- [x] Analyzed RFLOW_03 (successful full reflow), RFLOW_04 (warm start abort), RFLOW_05 (door-opened abort)
+- [x] Identified warm-start problem: thermal mass saturation reduces ramp rate above 220°C
+- [x] Identified door-opening problem: 5°C coast margin not enough if door bleeds heat during ramp
+- [x] SAC305 paste specs researched: 235°C min peak, 40-90s TAL, 10s min at peak
 
 ## Completed (2026-04-12)
 - [x] SAC305 peak temp reduced from 250°C to 240°C (47µF electrolytic was steaming at 237°C)
