@@ -32,7 +32,11 @@ static const ReflowProfile profileLeadFree = {
   .numStages   = 5,
   .stages = {
     { .name = "Preheat", .targetTemp = 150.0f, .rampRate =  2.0f, .holdTime = 0,  .heaterCutoff = 140.0f },
-    { .name = "Soak",    .targetTemp = 200.0f, .rampRate =  0.7f, .holdTime = 60, .heaterCutoff = 0      },
+    // Soak target must be REACHABLE: at 200 the PID never engaged (preheat coast
+    // + derivative suppression = 0% duty all soak, 2026-08-17 log analysis).
+    // 170 sits in the J-STD 150-180 band so the loop actively holds the board
+    // in-band; 90s hold covers the coast-overshoot (~183-185 peak) + fall-back.
+    { .name = "Soak",    .targetTemp = 170.0f, .rampRate =  0.7f, .holdTime = 90, .heaterCutoff = 0      },
     { .name = "Reflow",  .targetTemp = 235.0f, .rampRate =  2.0f, .holdTime = 0,  .heaterCutoff = 230.0f },
     { .name = "Peak",    .targetTemp = 235.0f, .rampRate =  0.0f, .holdTime = 10, .heaterCutoff = 0      },
     { .name = "Cool",    .targetTemp =  50.0f, .rampRate = -3.0f, .holdTime = 0,  .heaterCutoff = 0      },
