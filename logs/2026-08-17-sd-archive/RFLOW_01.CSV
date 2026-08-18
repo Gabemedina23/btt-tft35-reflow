@@ -1,0 +1,5 @@
+elapsed_s,board_c,ambient_c,target_c,duty_pct,state,stage,session:reflow
+0,,,,,EVENT,Lead-Free SAC305
+0,,,,,EVENT,Warmup started at 40.2C
+0,,,,,EVENT,Aborted by user
+0,,,,,EVENT,Session ended
